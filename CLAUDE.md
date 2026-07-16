@@ -166,6 +166,95 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Deployment Trap: the invisible `enabled: false` site override
+
+**Symptom:** sitesync does nothing for one artist on one machine — no syncing,
+for any provider — while Studio and Project settings both show `enabled: true`
+and the artist's Active/Remote sites and local root all look correct. No error,
+no failed-service icon (SiteSync is `ITrayAddon`, not `ITrayService`).
+
+**Cause:** a project-site override storing `enabled: false`, which beats the
+project's `true`. It is **not editable, or even visible, in the UI.**
+
+Why it is invisible — `ayon-frontend` `ObjectFieldTemplate.tsx` hides any field
+whose scope excludes the current level, and an **unscoped field defaults to
+`['studio','project']`**:
+
+```ts
+const validScopes = [...(ppts?.scope || ['studio', 'project'])]
+if (!validScopes.includes(props.formContext.level)) hiddenFields.push(propName)
+```
+
+`SiteSyncSettings.enabled` declares no `scope`, so the *Site settings* page
+(`/manageProjects/siteSettings`) never renders it — while `AddonSettings.jsx`
+still PUTs the whole form object, hidden fields included:
+
+```js
+const payloadData = { ...localData[key], __pinned_fields__: changedKeys[key], ... }
+```
+
+`ayon-backend` then stores it, because the write path is **not** scope-aware —
+`extract_overrides(default, overriden, existing, explicit_pins, explicit_unpins)`
+takes no `scope` argument, unlike its read-path sibling `list_overrides(...,
+scope=None)`. `enabled` defaults to `False`, so the stray value disables the
+addon.
+
+**This is an upstream AYON bug — it cannot be fixed from this addon.** All three
+routes are closed: declaring `scope` changes nothing (the field is already
+hidden); `get_project_site_overrides` only calls `convert_settings_overrides`
+during version migration, so an addon cannot filter it on read; and
+`site_settings_model` is consumed only by the studio-level `/settings/site`
+endpoint, not the project-site page.
+
+**Why it fully disables sync** (`client/ayon_sitesync/addon.py`):
+
+```python
+if not sync_project_settings["enabled"]:
+    return "studio"        # active forced to studio == remote -> nothing to sync
+
+roots = {}
+if not sitesync_settings["enabled"]:
+    return roots           # the artist's local root override is ignored too
+```
+
+### Detect
+
+The override is only visible with **both** `site_id` **and** the right user —
+overrides live in `project_{project}.project_site_settings`, keyed by
+`(addon_name, addon_version, user_name, site_id)`:
+
+```bash
+curl -s -H "x-api-key: $AYON_API_KEY" -H "x-as-user: <user>" \
+  "$AYON_SERVER_URL/api/addons/sitesync/<version>/rawOverrides/<project>?variant=production&site_id=<site>"
+# Bad if the response contains "enabled": false
+```
+
+Tray-side tell-tale: the addon report table shows `N/A` in the *Tray menu* and
+*Addons start* columns for sitesync.
+
+### Fix (removes only the stray key)
+
+```bash
+curl -X POST -H "x-api-key: $AYON_API_KEY" -H "x-as-user: <user>" \
+  -H "Content-Type: application/json" -d '{"action":"delete","path":["enabled"]}' \
+  "$AYON_SERVER_URL/api/addons/sitesync/<version>/overrides/<project>?variant=production&site_id=<site>"
+```
+
+Prefer deleting the override over setting it `true`: the site then inherits the
+project value instead of carrying its own private copy. `local_setting`
+(active/remote/roots) is untouched.
+
+### Audit (run after onboarding artists onto sitesync)
+
+Every artist who saves site settings can silently acquire this override, so
+re-check per project as it rolls out:
+
+```python
+# for each site in GET /api/system/sites, for each of its users:
+#   GET /api/addons/sitesync/<version>/rawOverrides/<project>?variant=production&site_id=<site>
+#   with header x-as-user: <user>   -> flag any response containing "enabled"
+```
+
 ## Commit Conventions
 
 ```
