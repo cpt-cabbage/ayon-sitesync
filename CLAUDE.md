@@ -166,6 +166,61 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Fixed on `luma`: studio-level `enabled` vetoed project overrides
+
+**Fixed in `1.3.1+ls.0.0.2`. Still present upstream — a merge can reintroduce it.**
+
+`compute_resource_sync_sites` used to gate on the **raw studio-level** setting as
+well as the project one:
+
+```python
+if (not self.sync_studio_settings["enabled"]                     # unresolved studio fetch
+    or not self.sync_project_settings[project_name]["enabled"]): # already-resolved
+    return [create_metadata(self.DEFAULT_SITE)]                  # marks ONLY studio=OK
+```
+
+`sync_project_settings` comes from `get_addon_project_settings(...)`, whose
+`use_site=True` default means it is **already resolved through studio → project →
+site**. `sync_studio_settings` is a *separate, unresolved* fetch
+(`get_studio_settings()`), so AND-ing it let a studio `false` veto a project
+`true`:
+
+| studio | project (resolved) | correct | old behaviour |
+|---|---|---|---|
+| True | True | on | on |
+| True | False | off | off |
+| False | False | off | off |
+| **False** | **True** | **on** | **off — the bug** |
+
+The check only ever changed the one row where an override is doing its job. With
+studio `false` + project `true`, every publish marked **only `studio=OK`** and no
+local record, so nothing synced in either direction — silently. It was also
+inconsistent with `get_active_site_type`, which checks only the resolved value.
+
+**Rule:** never re-check `sync_studio_settings["enabled"]`. The resolved project
+value is the whole hierarchy. Re-adding it breaks *"sitesync off studio-wide, on
+for one pilot project"*, which is the normal rollout shape.
+
+### Symptom to recognise
+
+A publish produces a single site entry (`studio=OK`) and no local record. The
+loop is then blind to it, because it only ever matches two exact pairs:
+
+```python
+upload:   local=OK      remote=QUEUED
+download: local=QUEUED  remote=OK
+```
+
+`NA (-1)` is neither, so the representation is invisible forever — waiting does
+not help. Status codes: `-1 NA · 0 IN_PROGRESS · 1 QUEUED · 2 FAILED · 3 PAUSED ·
+4 OK`.
+
+### Not fixed by this (by design)
+
+Farm renders publish with the farm's own `active=studio`, so they mark
+`studio=OK` only and never auto-download to an artist. Pull via the Manager/Nuke
+loader (which creates the local record), or configure `always_accessible_on`.
+
 ## Deployment Trap: the invisible `enabled: false` site override
 
 **Symptom:** sitesync does nothing for one artist on one machine — no syncing,
