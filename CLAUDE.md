@@ -367,6 +367,175 @@ re-check per project as it rolls out:
 #   with header x-as-user: <user>   -> flag any response containing "enabled"
 ```
 
+## How local sites resolve paths (read this before changing site config)
+
+**Residency is per-ROOT, not per-asset.** `local_setting.local_roots` is a list of
+*root name → local path*. Only the roots listed there are remapped:
+
+- `get_site_root_overrides` returns overrides **only** for `site_name == "local"`,
+  built from `local_roots`. `studio` returns `{}` — studio roots come from the
+  project Anatomy (Roots tab).
+- `ayon-core` `host/dirmap.py::_get_local_sync_dirmap` builds the workfile path
+  remap from exactly those entries (`W:/…` → `C:\WORK_LOCAL\…`).
+
+**LumaRND has a single `work` root, and BOTH templates hang off it:**
+
+```
+roots:   work -> W:
+work    : {root[work]}/{project}/{hierarchy}/{folder}/work/{task}
+publish : {root[work]}/{project}/{hierarchy}/{folder}/publish/{product[type]}/...
+```
+
+So overriding `work` moves the **work area** as well as publishes. With
+`active_site = local` everything under it resolves to `WORK_LOCAL`, and anything
+not downloaded is simply absent.
+
+**sitesync only ever syncs published representations.** Work-area files are not
+representations, so studio WIP scenes can never be fetched. This is by design,
+not a missing feature.
+
+**Consequences with a single root + `active_site = local`:**
+
+- create → save → publish → auto-upload: works.
+- studio work area (WIP scenes): unreachable, permanently.
+- any dependency not downloaded: missing (audio, plates, caches). See the
+  CollectAudio note in `ayon-core/CLAUDE.md` — *anything resolved through anatomy
+  on a local site can be absent*. Audio is just the first case people hit.
+
+Mixed residency ("scene over VPN, heavy sim local") is only expressible with
+**multiple roots** — e.g. `work` stays on `W:`, a `cache` root is routed via
+publish templates and listed in `local_roots`. **Untested**: the sync loop's
+behaviour for representations under a non-overridden root has not been verified.
+
+### The workfile bridge: `CopyLastPublishedWorkfile`
+
+`launch_hooks/pre_copy_last_published_workfile.py` (`order = -1`) seeds a task
+from the last **published** workfile. It verifies the repre is on the remote
+site, adds it *plus its `reference`-linked representations* to the local site,
+calls **`reset_timer()`** (so this path does not wait out `loop_delay`), blocks
+until it lands, `shutil.copy`s it into the work area at **`version + 1`**, and
+sets `data["last_workfile_path"]`.
+
+Selection matches the task, not just the folder:
+
+```python
+get_products(project_name, folder_ids={folder_id}, product_base_types={"workfile"})
+versions = get_last_versions(project_name, product_ids)
+version_ids = {v["id"] for v in versions.values() if v["taskId"] == task_id}
+# then first representation whose ext is in host_addon.get_workfile_extensions()
+```
+
+**Conditions — all must hold:**
+
+- **Local work area empty for that task** (`if os.path.exists(last_workfile):
+  return`). It is a *first-workfile seeder*, not a sync. Once a local workfile
+  exists it never fires again — holding a local v001 while a colleague publishes
+  v005 means launch silently opens **your v001**.
+- The published workfile must already be **on studio**.
+- **Launch blocks** while downloading.
+- **Host must be in `app_groups`:** blender, photoshop, tvpaint, aftereffects,
+  nuke, nukeassist, nukex, hiero, nukestudio, maya, harmony, celaction, flame,
+  fusion, houdini. **Not** resolve, unreal, substancepainter, substancedesigner,
+  motionbuilder, gaffer, openrv, premiere — on a local site those have **no
+  bridge at all**.
+
+### Bug: `use_last_published_workfile` is a dead setting
+
+`core → tools → Workfiles → last_workfile_on_startup` exposes
+`use_last_published_workfile` (core `server/settings/tools.py`), but it is read
+**nowhere** in core's client. The hook gates on the wrong function:
+
+```python
+from ayon_core.pipeline.workfile import should_use_last_workfile_on_launch
+use_last_published_workfile = should_use_last_workfile_on_launch(...)
+if use_last_published_workfile is False:
+    return
+```
+
+…and that returns `matching_item.get("enabled")`. No
+`should_use_last_published_workfile_on_launch` exists. **So the toggle does
+nothing** and the hook runs whenever *"open last workfile on startup"* is true.
+An empty scene therefore means the task had no published workfile matching its
+`taskId` + extension — not that the feature is off. Candidate upstream PR.
+
+---
+
+## Possible Future Work
+
+### 1. `reset_timer()` is not wired to manual actions
+
+`reset_timer()` skips the remaining `loop_delay` and already works cross-process
+— from a DCC (`sitesync_thread is None`) it POSTs to
+`{AYON_WEBSERVER_URL}/sitesync/reset_timer` to wake the tray:
+
+```python
+if self.sitesync_thread is None:
+    self._reset_timer_with_rest_api()
+else:
+    self.sitesync_thread.reset_timer()
+```
+
+Its **only** caller is the launch hook (`sitesync.py:309`). `add_site` never
+calls it, so Loader/Manager Download and publish-upload wait out the remaining
+`loop_delay` (60s default) — the observed "takes a minute to start".
+
+**Fix:** call `reset_timer()` at the end of `add_site` (existing machinery, no new
+endpoint). No-code alternative: lower `sitesync → config → Loop Delay`, at the
+cost of constant polling from every tray.
+
+### 2. Opening existing (unpublished) workfiles on a local site
+
+Investigated 2026-07-16. **Most of the coordination already exists** — the gap is
+only file transfer:
+
+- **Workfile entities are already server-side, keyed by ROOTLESS path**
+  (`save_workfile_info(..., rootless_path)`, `find_workfile_rootless_path` in
+  `ayon_core/pipeline/workfile/utils.py`). A studio `W:/…/scene_v001.ma` and a
+  local `C:\WORK_LOCAL\…\scene_v001.ma` are the **same record**, so cross-site
+  version coordination is already done — saving writes the entity.
+- **The Workfiles tool lists from the server, not disk**, then greys by local
+  existence (`tools/workfiles/models/workfiles.py`):
+
+```python
+workfile_entities = list(ayon_api.get_workfiles_info(...))   # server
+exists = os.path.exists(filepath)                            # local -> greyed
+```
+
+  So studio workfiles **are** listed for a local-site artist; they are greyed
+  because the bytes are absent, not because they are unknown.
+- **The published-workfiles tab already exists and is availability-aware.**
+  `get_published_file_items()`; `PublishedWorkfileInfo` carries
+  `representation_id` **and `available: bool`** ("True if workfile is available on
+  the machine"); `copy_workfile_representation()` copies one into the work area as
+  a new version. Published workfiles are the **only** syncable workfile form — so
+  they are worth keeping.
+
+**Hard constraint:** sitesync cannot sync work-area files. It is
+representation-keyed throughout (`sitesync_files_status` = `representation_id` +
+`file_id`); a work-area file has no representation to hang a site record on.
+
+**Options, cheapest first:**
+
+1. **Use what exists** — publish workfiles; pull the workfile representation via
+   the Loader; Workfiles → Published tab → *Copy & Open*. Zero code. Test whether
+   this is usable before building anything.
+2. **New launch hook: copy latest work-area file studio → local.** ~150 lines,
+   mirroring `CopyLastPublishedWorkfile`: `ayon_api.get_workfiles_info(task_id)` →
+   pick latest by rootless path → resolve studio + local paths from anatomy → copy
+   if the local is missing → set `last_workfile_path`. **No sitesync involvement**
+   — a plain copy between two reachable roots. Only valid while the studio root is
+   reachable (VPN); useless for a genuinely remote artist.
+3. **Teach sitesync to sync work-area files.** Large: needs a parallel mechanism
+   (server tables, endpoints, UI, loop logic) since nothing is representation-keyed.
+   A new feature and a permanent upstream divergence. Not recommended.
+
+### 3. Extend the launch hook's `app_groups`
+
+Roughly half our DCCs (resolve, unreal, substancepainter, substancedesigner,
+motionbuilder, gaffer, openrv, premiere) are absent from the hook's `app_groups`,
+so on a local site they get an empty scene with no bridge. Adding them is a
+one-line list change; whether the hook actually *works* for each host is unverified.
+
 ## Commit Conventions
 
 ```
