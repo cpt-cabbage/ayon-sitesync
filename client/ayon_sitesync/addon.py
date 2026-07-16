@@ -313,10 +313,14 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 status = SiteSyncStatus.QUEUED
             return {"name": name, "status": status}
 
-        if (
-            not self.sync_studio_settings["enabled"]
-            or not self.sync_project_settings[project_name]["enabled"]
-        ):
+        # Project settings are already resolved through studio -> project ->
+        # site, so this single check honours the whole override hierarchy.
+        # Do NOT re-check `sync_studio_settings["enabled"]` here: that is an
+        # unresolved studio-level fetch, and AND-ing it would let a studio
+        # `false` veto a project `true` - defeating the project override and
+        # marking only 'studio', so nothing ever syncs. Matches the check in
+        # `get_active_site_type`.
+        if not self.sync_project_settings[project_name]["enabled"]:
             return [create_metadata(self.DEFAULT_SITE)]
 
         local_site = self.get_active_site(project_name)
