@@ -462,6 +462,64 @@ An empty scene therefore means the task had no published workfile matching its
 
 ## Possible Future Work
 
+### 0. Read this first: local site targets a *remote* artist, not a *hot-desking* one
+
+Investigated 2026-07-16 while piloting `active_site = local` over VPN. This
+reframes everything below it.
+
+**The intended flow is NOT "download a published workfile, then open it."** It is:
+**launch the task**. `CopyLastPublishedWorkfile` seeds an *empty* work area from
+the last published workfile automatically — download, copy to `version + 1`, open.
+Opening an empty scene and loading via the DCC's Workfiles → Published tab is a
+fallback that happens to work, not the design. Nobody should be told to do that.
+
+**Two genuine gaps, both narrow:**
+
+1. **The launcher's Workfiles page is a dead end on a local site.**
+   `tools/launcher/models/workfiles.py::get_workfile_items`:
+
+   ```python
+   for workfile_entity in ayon_api.get_workfiles_info(project_name, task_ids={task_id}, ...):
+       path = anatomy.fill_root(workfile_entity["path"])   # ACTIVE site's root
+       exists = os.path.exists(path)                       # False -> greyed
+       version = workfile_data.get("version")              # version IS in data
+   ```
+
+   It lists work-area entities, resolves them against the **local** root, finds
+   nothing, and greys them — **with no action attached, no published tab, no
+   download button**. It shows studio WIP files that can never be opened.
+
+2. **The hook only seeds an empty work area.** Once any local workfile exists for
+   the task it never fires again, so a colleague's newer published version cannot
+   be picked up at launcher level — only via the in-DCC Published tab.
+
+**The conclusion that matters.** sitesync's local site assumes the artist has **no
+access to the studio share**: pull everything down, work locally, publish back.
+Published workfiles are the transfer medium *between* sites — which is exactly why
+they are the only syncable workfile form, and why work-area files are not synced.
+
+Luma's actual goal is different: **VPN-connected with `W:` reachable, wanting to
+cache only heavy data (e.g. sim) locally while scene + small assets stay on the
+share.** That is a *caching* problem being solved with a *remote-artist* feature,
+which is why every step fights back — greyed workfiles, missing audio, manual
+downloads, the CollectAudio failure. None of those are misconfiguration; they are
+all the same assumption showing through.
+
+**The only shape in AYON that expresses the actual goal is multi-root:** `work`
+stays on `W:` (launcher works normally, nothing greys, scene opens over VPN) and a
+separate cache-style root — routed via publish templates — is listed in
+`local_roots`. **Untested.** Verify the sync loop's behaviour for representations
+under a non-overridden root before committing an anatomy change to it.
+
+Also relevant to any "coordinate local workfile versions via the DB" idea:
+`data.version` and `data.host_name` are **already** stored on workfile entities, and
+paths are rootless — so that coordination is not missing. Only file transfer is.
+
+**Next test (cheap, decides a lot):** on a task that *has* a published workfile,
+with an *empty* local work area, just launch Maya/Nuke. If it opens seeded from the
+published workfile, the feature works as designed and the remaining friction is
+purely wrong-fit. If it does not, there is another bug to chase.
+
 ### 1. `reset_timer()` is not wired to manual actions
 
 `reset_timer()` skips the remaining `loop_delay` and already works cross-process
