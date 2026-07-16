@@ -166,6 +166,69 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Fixed on `luma`: manual transfers waited out `loop_delay`
+
+**Fixed in `1.3.1+ls.0.0.4`. Still present upstream — a merge can reintroduce it.**
+
+Clicking **Download**/**Upload** in the Loader or Scene Inventory created the site
+record but did not wake the sync loop, so nothing moved for up to `loop_delay`
+(60s default). Same for the upload after a publish. `reset_timer()` existed and
+already worked cross-process, but its **only** caller was the launch hook
+(`sitesync.py:309`) — `add_site` never called it.
+
+**Fix:** `add_site` now calls `self.reset_timer()` after writing the state.
+
+```python
+if self.sitesync_thread is None:
+    self._reset_timer_with_rest_api()   # in a DCC -> POST to the tray's webserver
+else:
+    self.sitesync_thread.reset_timer()  # in the tray -> cancel the wait directly
+```
+
+**Required companion fix — do not drop it.** `_reset_timer_with_rest_api` had an
+unguarded, timeout-less `requests.post(rest_api_url)`. Since `add_site` runs during
+publish (`integrate_site_sync` calls it per representation), an unreachable tray
+webserver would have raised `ConnectionError` straight through `add_site` and
+**failed the publish**; a hung tray would have blocked it forever. The POST is now
+`timeout=2` inside `try/except` — resetting a timer is best-effort and must never
+break its caller. Verified by stubbing `requests.post` to raise: the call survives
+and logs a warning.
+
+**Rule:** anything called from `add_site` must be non-fatal. It sits on the publish
+path.
+
+No-code alternative to this fix, if it is ever reverted: lower
+`sitesync → config → Loop Delay`, at the cost of constant polling from every tray.
+
+### Related: live progress % is available but nothing polls it
+
+`local_drive._mark_progress()` writes a real 0–1 fraction to the DB every
+`LOG_PROGRESS_SEC` (**5s**) during a transfer, comparing source vs target file
+size, for **both** directions:
+
+```python
+side = "local"
+if direction == "Upload":
+    side = "remote"
+```
+
+So **Download animates the *Active site* column, Upload the *Remote site* column**,
+and `get_representations_site_progress` returns both in one call — one refresh
+updates both; no separate window is needed.
+
+Nothing displays it because the **UI never re-asks**: Scene Inventory refreshes
+once via `view.data_changed` (fired right after the click, *before* any bytes move)
+or the manual Refresh button. There is no poll timer.
+
+**The Manager and Loader are `ayon-core` tools**, not sitesync — sitesync only
+supplies the data. So a poll timer (~5s while anything is in flight, stopped when
+settled) is a **core** change and would mean forking core's UI. Deferred: the
+practical value is mostly on Download (the user is watching); Upload happens during
+publish with the window usually closed.
+
+Note `1.3.1+ls.0.0.3`'s accumulator fix is what makes a climbing % meaningful — before
+it, a part-synced representation reported 0%.
+
 ## Fixed on `luma`: Scene Inventory showed 0% and "Download" silently no-opped
 
 **Fixed in `1.3.1+ls.0.0.3`. Still present upstream — a merge can reintroduce it.**
@@ -520,26 +583,9 @@ with an *empty* local work area, just launch Maya/Nuke. If it opens seeded from 
 published workfile, the feature works as designed and the remaining friction is
 purely wrong-fit. If it does not, there is another bug to chase.
 
-### 1. `reset_timer()` is not wired to manual actions
+### 1. ~~`reset_timer()` is not wired to manual actions~~ — FIXED in `1.3.1+ls.0.0.4`
 
-`reset_timer()` skips the remaining `loop_delay` and already works cross-process
-— from a DCC (`sitesync_thread is None`) it POSTs to
-`{AYON_WEBSERVER_URL}/sitesync/reset_timer` to wake the tray:
-
-```python
-if self.sitesync_thread is None:
-    self._reset_timer_with_rest_api()
-else:
-    self.sitesync_thread.reset_timer()
-```
-
-Its **only** caller is the launch hook (`sitesync.py:309`). `add_site` never
-calls it, so Loader/Manager Download and publish-upload wait out the remaining
-`loop_delay` (60s default) — the observed "takes a minute to start".
-
-**Fix:** call `reset_timer()` at the end of `add_site` (existing machinery, no new
-endpoint). No-code alternative: lower `sitesync → config → Loop Delay`, at the
-cost of constant polling from every tray.
+See *"Fixed on `luma`: manual transfers waited out `loop_delay`"* below.
 
 ### 2. Opening existing (unpublished) workfiles on a local site
 
