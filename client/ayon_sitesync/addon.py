@@ -1655,12 +1655,23 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         remote_site_name=None
     ):
         representation_id = representation["id"]
-        sync_status = self.get_repre_sync_state(
+        # NOTE: deliberately NOT `get_repre_sync_state` here. That helper
+        # returns None when the *local* site has no record yet - which is
+        # exactly when progress must still be reported, because the remote
+        # side's availability is what tells the UI (and the Manager's
+        # "Download" action) that the files can be fetched at all. Using it
+        # here made every not-yet-downloaded representation read 0%/0%, and
+        # the Manager's `check_progress == 1` guard then silently refused to
+        # queue the download. Other callers of `get_repre_sync_state` pass a
+        # single site and rely on its None-when-absent behaviour, so it is
+        # left untouched.
+        repre_states = self._get_repres_state(
             project_name,
-            representation_id,
+            {representation_id},
             local_site_name,
             remote_site_name
         )
+        sync_status = repre_states[0] if repre_states else None
 
         progress = {
             local_site_name: -1,
