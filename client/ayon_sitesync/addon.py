@@ -881,7 +881,17 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
             return
 
-        requests.post(rest_api_url)
+        # Resetting the timer is best-effort: it only skips a wait. It must
+        # never raise, because `add_site` calls this during publish - an
+        # unreachable or hung tray webserver would otherwise fail the publish.
+        # A timeout is required: `requests` waits forever by default.
+        try:
+            requests.post(rest_api_url, timeout=2)
+        except Exception:
+            self.log.warning(
+                "Couldn't reset sync timer via {}".format(rest_api_url),
+                exc_info=True
+            )
 
     def get_enabled_projects(self):
         """Returns list of projects which have SiteSync enabled."""
