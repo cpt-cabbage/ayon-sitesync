@@ -166,6 +166,63 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Fixed on `luma`: Scene Inventory showed 0% and "Download" silently no-opped
+
+**Fixed in `1.3.1+ls.0.0.3`. Still present upstream — a merge can reintroduce it.**
+
+Symptom: in Nuke's Scene Inventory (Manager), representations that *are* on
+studio showed **Active 0% / Remote 0%**, and right-click → **Download** did
+nothing, with no error. The Loader (standalone browser) worked fine.
+
+`get_repre_sync_state` refuses to return state when the **local** site has no
+record:
+
+```python
+if repre_state["localStatus"]["status"] != -1:   # -1 == NA (no local record)
+    return repre_state
+# else -> None
+```
+
+`_get_progress_for_repre_new` then hit `if not sync_status: return {local: -1,
+remote: -1}` and the UI rendered **0%/0%** — discarding the *remote* progress
+purely because the *local* side was empty.
+
+That created a **catch-22** with the Manager's guard
+(`ayon-core/tools/sceneinventory/models/sitesync.py`):
+
+```python
+check_progress = repre_progress["remote_site"]   # the OPPOSITE site
+if check_progress == 1:                          # must be exactly 100%
+    sitesync_addon.add_site(project_name, repre_id, site, force=True)
+```
+
+- Download needs remote == 100%
+- remote only reads 100% once the **local** record exists
+- the local record only exists **after** a download
+
+⇒ Manager Download could never work for anything not already local, and failed
+silently. The Loader was unaffected because it uses
+`get_representations_sync_state` / `get_version_availability`
+(the `/state/representations` endpoint, no `-1` filter) and calls
+`add_site(force=True)` unguarded.
+
+**Fix:** `_get_progress_for_repre_new` now calls `_get_repres_state` directly
+instead of `get_repre_sync_state`.
+
+**Rule:** do NOT "simplify" that back to `get_repre_sync_state`, and do NOT
+remove the `!= -1` filter globally. Four other callers (`add_site`,
+`remove_site`, `is_representation_on_site`, the alternate-site update) pass a
+single site and **rely** on None-when-absent as their "does this site have a
+record?" test. Only the progress path needs the exemption.
+
+Also fixed alongside: the accumulator branch did `progress[site_name] = 0`,
+which **reset** rather than preserved, so one unsynced file zeroed a whole
+representation's percentage. It now keeps `norm_progress` — a 13-of-26 sync
+reads 50%, not 0%.
+
+Do **not** patch core's Manager guard: with progress correct, it passes on its
+own.
+
 ## Fixed on `luma`: studio-level `enabled` vetoed project overrides
 
 **Fixed in `1.3.1+ls.0.0.2`. Still present upstream — a merge can reintroduce it.**
