@@ -587,6 +587,76 @@ purely wrong-fit. If it does not, there is another bug to chase.
 
 See *"Fixed on `luma`: manual transfers waited out `loop_delay`"* below.
 
+### 1b. "Remove from local" raises on a cosmetic `rmdir` failure
+
+Reported 2026-07-17 on `1.3.1+ls.0.0.4`, removing a representation from the local
+site via the Loader:
+
+```
+File "ayon_sitesync\addon.py", line 2109, in _remove_local_file
+    os.rmdir(folder)
+PermissionError: [WinError 5] Access is denied:
+    'C:\Users\<user>\OneDrive - Luma\Desktop\WORK_LOCAL/LumaRND/.../renderLookdevTest/v005'
+...
+ValueError: folder ... cannot be removed
+```
+
+Files were deleted; the empty folder remained; the artist got a traceback.
+
+**Not data-corrupting.** `remove_site` deletes the server-side site record
+**before** touching any file, so the DB is already correct when this blows up —
+the representation simply reads as "not on local", which is true. Re-download
+works.
+
+**The design bug** — `_remove_local_file`:
+
+```python
+folder = os.path.dirname(local_file_path)
+if os.listdir(folder):      # not empty -> skip
+    continue
+try:
+    os.rmdir(folder)
+except OSError:
+    msg = "folder {} cannot be removed".format(folder)
+    self.log.warning(msg)
+    raise ValueError(msg)   # <-- aborts the whole removal
+```
+
+Deleting the now-empty directory is **incidental cleanup**, but a failure
+`raise`s. Two consequences:
+
+1. An alarming traceback for an operation that actually succeeded.
+2. The `raise` aborts the loop — a representation whose files span **several**
+   folders would be **partially deleted** if an early folder's `rmdir` fails.
+   (Not the case above: `rmdir` only runs once a folder is empty, i.e. after its
+   last file, so that single-folder repre was fully removed.)
+
+**Deferred fix:** log the warning and continue; never raise. The directory is not
+the point of the operation. (`os.remove` failing *should* still raise — that is
+the actual work.)
+
+**Root cause of the `rmdir` denial — the local root is inside OneDrive.**
+`WinError 5` (access denied, *not* `145` "directory not empty") on an empty
+folder means a handle is held or the ACL forbids it. The path is
+`C:\Users\<user>\OneDrive - Luma\Desktop\WORK_LOCAL\…` — **OneDrive is syncing
+the sitesync local root**.
+
+**A OneDrive-backed folder is a poor choice for a sitesync local root**, quite
+apart from this bug:
+
+- OneDrive holds handles on folders it is syncing → exactly this `rmdir` denial,
+  and it will be intermittent/timing-dependent.
+- Everything sitesync pulls down gets **re-uploaded to the cloud** — renders and
+  caches included. Double sync, double bandwidth, and potentially enormous
+  OneDrive usage.
+- Files On-Demand can leave placeholders (dehydrated files) where sitesync
+  expects real bytes, so `os.path.exists` can be true while a read stalls or
+  fails.
+
+Recommend a plain local path outside any cloud-synced tree (e.g.
+`C:\ayon_local\…`) before drawing conclusions from further local-site testing —
+some flakiness may be OneDrive, not sitesync.
+
 ### 2. Opening existing (unpublished) workfiles on a local site
 
 Investigated 2026-07-16. **Most of the coordination already exists** — the gap is
