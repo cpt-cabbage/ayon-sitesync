@@ -5,6 +5,8 @@ sites. On some might be present (by default 'studio'), on some needs to
 be synchronized.
 
 """
+from __future__ import annotations
+
 from collections import defaultdict
 
 import pyblish.api
