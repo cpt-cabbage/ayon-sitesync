@@ -583,6 +583,37 @@ with an *empty* local work area, just launch Maya/Nuke. If it opens seeded from 
 published workfile, the feature works as designed and the remaining friction is
 purely wrong-fit. If it does not, there is another bug to chase.
 
+### Standing verdict (2026-07-17, after a full day of piloting)
+
+**The fixes make sitesync work correctly. They do not make it the right tool for
+this job.**
+
+Five upstream bugs were found, fixed and shipped (`+ls.0.0.1` → `+ls.0.0.4`), and
+sitesync now behaves as designed: downloads, uploads, publishes and sharing all
+work. What remains is **fit**, not defects — and it is one mismatch surfacing
+repeatedly, not a list of unrelated problems:
+
+| symptom | same root cause |
+|---|---|
+| greyed-out workfiles in the launcher | work area moved to the local root; work-area files are never synced |
+| review publish failed on missing audio | anything resolved through anatomy on a local site can be absent |
+| downloads must be requested by hand | only published representations sync, and only on request |
+| sharing needs 3 tools (§ 1c) | published representations are the *only* transfer medium between sites |
+
+All of it follows from one assumption: **the local site targets a *remote* artist
+with no access to the studio share** — pull everything down, work locally, publish
+back. Luma's actual goal is a *caching* problem: VPN-connected, `W:` reachable,
+wanting only heavy data (e.g. sim caches) local while the scene and small assets
+stay on the share.
+
+**Multi-root remains the only shape in AYON that expresses the actual goal**
+(`work` stays on `W:`; a cache-style root routed via publish templates and listed
+in `local_roots`) — and it is **untested**. Verify sync-loop behaviour for
+representations under a non-overridden root before committing an anatomy change.
+
+Revisit this section before further investment. The deferred items below are worth
+doing *if* the model is kept; none of them changes the fit.
+
 ### 1. ~~`reset_timer()` is not wired to manual actions~~ — FIXED in `1.3.1+ls.0.0.4`
 
 See *"Fixed on `luma`: manual transfers waited out `loop_delay`"* below.
@@ -656,6 +687,62 @@ apart from this bug:
 Recommend a plain local path outside any cloud-synced tree (e.g.
 `C:\ayon_local\…`) before drawing conclusions from further local-site testing —
 some flakiness may be OneDrive, not sitesync.
+
+### 1c. Sharing work on a local site: possible, but heavily obfuscated
+
+**Verified working 2026-07-17.** A local-site artist *can* pick up a colleague's
+studio-published workfile — so this does not rule out the model. But it takes
+**three tools**, none of which signposts the next, and no artist will find it
+unaided.
+
+**The path:**
+
+1. **Loader** → the colleague's `workfile` product → **Download**
+2. wait for sync (near-instant since the `reset_timer` fix in `+ls.0.0.4`)
+3. **Workfiles → Published tab** → the item becomes selectable → **Copy & Open**
+
+**Why step 1 is the magic one** — `ayon-core`
+`tools/loader/models/sitesync.py::_add_site` special-cases workfile products,
+pulling the scene **and its dependencies**:
+
+```python
+# TODO this should happen in site sync addon     <- upstream's own comment
+if product_type != "workfile":
+    return
+links = self._get_linked_representation_id(project_name, repre_entity, "reference")
+for link_repre_id in links:
+    ...add_site(project_name, link_repre_id, site_name, force=True)
+```
+
+That code exists *only* to enable this workflow — from a tool most artists would
+never associate with opening a workfile.
+
+**Why it looks impossible** — `ayon-core`
+`tools/workfiles/widgets/files_widget_published.py`:
+
+```python
+if file_item.available:        # available = os.path.exists(filepath)
+    flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+else:
+    flags = Qt.NoItemFlags     # visible, inert: no select, no click, no tooltip
+```
+
+The colleague's workfile is **visible and completely inert**. There is **no
+download action anywhere in the Workfiles tool**, and nothing pointing at the
+Loader. Add the launch hook refusing to fire once any local workfile exists
+(§ *"How local sites resolve paths"*), and every obvious door is locked — the
+unlocked one is in another tool.
+
+**Deferred fix options** — both are `ayon-core` **UI** changes (forking core's UI,
+same bucket as the live-% poll timer):
+
+- Published tab: allow selecting an unavailable item and offer **Download**
+  (`add_site` + poll until available), or
+- minimum viable: a tooltip/status — *"not on your site — download it from the
+  Loader"*.
+
+**The real defect is discoverability, not capability.** Worth keeping straight:
+that is a tooltip-sized problem, not a blocker.
 
 ### 2. Opening existing (unpublished) workfiles on a local site
 
