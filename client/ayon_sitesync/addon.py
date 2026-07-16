@@ -237,6 +237,14 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             project_name, representation_id, site_name, payload_dict, force
         )
 
+        # Wake the sync loop now instead of waiting out `loop_delay` (60s by
+        # default). Previously only the launch hook did this, so anything a
+        # user actually waits on - Loader/Manager "Download"/"Upload", and the
+        # upload after a publish - sat idle for up to a minute before the
+        # transfer even started. `reset_timer` works cross-process: from a DCC
+        # it POSTs to the tray's webserver. It is best-effort and never raises.
+        self.reset_timer()
+
     def remove_site(
         self,
         project_name,
