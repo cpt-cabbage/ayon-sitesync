@@ -1697,8 +1697,13 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 elif status_info.get("progress"):
                     progress[site_name] = norm_progress + status_info[
                         "progress"]
-                else:  # site exists, might be failed, do not add again
-                    progress[site_name] = 0
+                else:
+                    # Site exists but this file is not available (queued,
+                    # failed, paused). Don't count it - but keep what other
+                    # files already contributed, otherwise a single unsynced
+                    # file zeroes the whole representation's percentage
+                    # instead of showing it as partially synced.
+                    progress[site_name] = norm_progress
 
         # for example 13 fully avail. files out of 26 >> 13/26 = 0.5
         return {
