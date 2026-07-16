@@ -1,8 +1,21 @@
 import os
 
-import dropbox
+from ayon_core.lib import Logger
 
 from .abstract_provider import AbstractProvider
+
+log = Logger.get_logger("SiteSync-DropboxHandler")
+
+dropbox = None
+try:
+    import dropbox
+except (ImportError, SyntaxError):
+    # Dropbox is an optional provider, but `providers/lib.py` imports this
+    # module unconditionally - an unguarded import here takes the whole addon
+    # down on `tray_init`. Mirrors the guard in `sftp.py`.
+    log.warning(
+        "Dropbox module import failed, Dropbox provider will be unavailable."
+    )
 
 
 class DropboxHandler(AbstractProvider):
@@ -14,6 +27,13 @@ class DropboxHandler(AbstractProvider):
         self.site_name = site_name
         self.presets = presets
         self.dbx = None
+
+        if dropbox is None:
+            self.log.info(
+                "Sync Server: Dropbox module unavailable,"
+                " provider is disabled."
+            )
+            return
 
         if not self.presets:
             self.log.info(
