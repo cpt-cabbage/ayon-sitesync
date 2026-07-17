@@ -14,7 +14,7 @@ const AddonWrapper = () => {
   // const addonName = useContext(AddonContext).addonName
   const addonName = 'sitesync'
   // const addonVersion = useContext(AddonContext).addonVersion
-  const addonVersion = '1.3.1+ls.0.7.0'
+  const addonVersion = '1.3.1+ls.0.8.0'
   const accessToken = useContext(AddonContext).accessToken
   const projectName = useContext(AddonContext).projectName
   const userName = useContext(AddonContext).userName
