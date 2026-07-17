@@ -250,11 +250,11 @@ Client (`addon.py`, `auto_download.py`, `tray_control_window.py`,
   dependencies now come along); ledger pruned of deleted representations
   once per project per tray session (`_prune_project_ledger`).
 
-NOT implemented (out of this repo / needs a product decision): Loader
-dependency-pull for non-workfile products (core hardcodes
-`product_type == "workfile"` — the USD layered/assembly gap), a poll
-timer in core's Manager/Loader UIs, local retention/GC of old downloads,
-priority UI. Farm renders still mark `studio=OK` only, by design.
+NOT implemented: see *"Deferred from the 2026-07-17 full audit"* under
+**Possible Future Work** for the detailed list (USD/Loader dependency
+pull, core UI poll timer, retention/GC, priority wiring, farm renders,
+published-tab UX, orphan-repre backfill) with design questions and
+recommended first steps per item.
 
 ## Added on `luma` (unreleased, after `0.9.0`): all-in-one sync control panel
 
@@ -924,6 +924,95 @@ An empty scene therefore means the task had no published workfile matching its
 ---
 
 ## Possible Future Work
+
+### Deferred from the 2026-07-17 full audit (read before extending sitesync)
+
+The full audit (see the "full-audit fix batch" section above for what WAS
+fixed) deliberately left the items below unimplemented. Each is either
+ayon-core's code, a product decision with real trade-offs, or a new
+server capability. Priorities: **item A and item G first** — A because
+USD workflows will hit it, G because its failure mode is the worst kind
+(silent, permanent, invisible).
+
+**A. Loader dependency-pull for non-workfile products — the real USD gap.**
+Downloading a USD assembly/layered look via the Loader pulls exactly one
+representation. `ayon-core tools/loader/models/sitesync.py::_add_site`
+hardcodes `if product_type != "workfile": return` (upstream's own comment:
+"TODO this should happen in site sync addon") and follows only `reference`
+links. Two design questions block a naive fix:
+- *Link types*: `integrate_inputlinks.py` writes `reference` links for
+  what a workfile LOADED and `generative` links for what a version was
+  MADE FROM. A USD look → its texture product is typically `generative`,
+  so dropping the product-type guard while keeping `"reference"` pulls
+  nothing for most USD cases. Follow `reference` + `generative` inputs,
+  depth-limited.
+- *Link existence*: links only exist if the DCC addon populated
+  `loadedVersions`/`inputVersions`/`inputRepresentations` at publish.
+  **First step: check one real production USD publish for links**
+  (`GET /versions/{id}/links`). If present → ~15-line change in the core
+  fork's `_add_site` (reuse `auto_download_link_depth`). If absent → it
+  is a publish-side collection problem in the USD plugins, own design.
+Partial mitigation already shipped: auto-download follows `reference`
+links to `auto_download_link_depth` (default 2), which covers
+workfile-loaded content but not direct Loader downloads.
+
+**B. Live-progress poll timer in core's Manager/Loader.** The audit batch
+made the per-file 0-1 fraction real in the DB for the first time, but
+core's Scene Inventory/Loader still fetch availability exactly once (on
+click / manual Refresh). A ~5s QTimer while anything reads IN_PROGRESS,
+stopped when settled, is a small self-contained change in the core fork;
+sitesync needs nothing more. The tray control panel already polls, so
+artists have one place to watch transfers meanwhile.
+
+**C. Local retention / GC of downloaded data.** Nothing ever deletes old
+downloads; `min_free_space_gb` only stops NEW downloads (a brake, not a
+cleaner). Product questions first: delete what (superseded versions?
+unassigned tasks? age?), when, and how to respect artist intent (keeping
+v003 deliberately while v007 exists). Mechanics are ready:
+`remove_site(remove_local_files=True)` per repre is now safe thanks to
+the sibling-guard. Start conservative: a tray action "Clean up superseded
+versions" that LISTS what it would remove with size totals - no
+automatic policy until that has earned trust.
+
+**D. Priority is schema-deep but wired to nothing.** The table, index,
+POST model and `update_db` all carry `priority` - but no UI sets it AND
+the sync loop never orders by it (`/state`'s `SortByEnum` doesn't even
+offer priority, so the loop's fetch ignores it). Making it real = add
+priority to `SortByEnum` + ORDER BY, sort the loop fetch, add a tray
+context-menu control. Cheap; do it when "sync this shot first" is asked.
+
+**E. Farm renders never reach an artist's local site.** Farm publishes
+mark `studio=OK` only; auto-download follows workfile + `reference`
+links, which exclude render outputs. Deliberate for now - renders are the
+heaviest data and auto-pulling could saturate VPN + disks. If wanted:
+either follow `generative` links FROM the task's workfile version (its
+outputs) behind a default-off setting, or - preferred first - a per-task
+"download my latest renders" pull-on-demand action.
+
+**F. Published-tab discoverability** (see § 1c below): the colleague's
+workfile is visible-but-inert (`Qt.NoItemFlags` in core's
+`files_widget_published.py`), no download action, no hint the Loader can
+fetch it. Minimum: tooltip. Proper: selectable-when-unavailable +
+Download action (`add_site` + poll). Both are core-fork edits.
+
+**G. Backfill for repres created outside the normal publish.** Core's
+Push-to-project, editorial ingest, or a publish from a machine where the
+sitesync addon was disabled/crashed create representations with NO site
+records - an NA/NA pair is invisible to the sync loop forever and nothing
+detects it. The rewritten `validate_project` can heal the LOCAL side
+(honest per-file adopt) but nothing creates the missing STUDIO record.
+Clean fix: server-side event handler on representation creation (or a
+periodic job) stamping default site records - a new server capability,
+needs its own design (what sites should a pushed repre get?). Cheap
+interim: a one-off script creating `studio=OK` rows for repres with zero
+site rows, plus an adopt run.
+
+**Deliberately untouched smalls:** `update_db`'s dead `pause`-key POST
+(harmless, removing it grows the upstream diff); alternative-site
+order-dependency when a site is alt-paired to BOTH active and remote
+(a misconfiguration); the multi-root caching model (still untested,
+still the only shape matching Luma's actual goal - an anatomy/pilot
+decision, not addon code; see the Standing verdict below).
 
 ### 0. Read this first: local site targets a *remote* artist, not a *hot-desking* one
 
