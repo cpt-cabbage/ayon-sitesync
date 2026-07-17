@@ -1,8 +1,13 @@
 import os
 import time
 
-from ayon_core.lib import Logger
-from ayon_api import get_representations, get_versions_links
+from ayon_core.lib import Logger, is_func_signature_supported
+from ayon_api import (
+    get_representations,
+    get_versions_links,
+    get_products,
+    get_last_versions,
+)
 
 
 log = Logger.get_logger("SiteSync")
@@ -108,6 +113,68 @@ class EditableScopes:
     SYSTEM = 0
     PROJECT = 1
     LOCAL = 2
+
+
+def get_last_published_workfile_representation(
+    project_name, folder_id, task_id, workfile_extensions=None
+):
+    """Last published workfile representation for a task.
+
+    Shared by the pre-launch hook (which passes the host's workfile
+    extensions) and the auto-download service (which accepts any).
+
+    Args:
+        project_name (str): Project name.
+        folder_id (str): Folder id.
+        task_id (str): Task id - only versions of this task match.
+        workfile_extensions (Optional[Iterable[str]]): Extensions with
+            leading dot to accept. All accepted when None.
+
+    Returns:
+        Union[dict, None]: Representation entity or None.
+    """
+    kwargs = dict(
+        folder_ids={folder_id},
+        product_base_types={"workfile"},
+    )
+    # TODO add requirement for AYON launcher 1.4.3 when removed
+    if not is_func_signature_supported(
+        get_products, project_name, **kwargs
+    ):
+        kwargs["product_types"] = kwargs.pop("product_base_types")
+
+    product_entities = get_products(project_name, **kwargs)
+    product_ids = {
+        product_entity["id"]
+        for product_entity in product_entities
+    }
+    if not product_ids:
+        return None
+
+    versions_by_product_id = get_last_versions(
+        project_name,
+        product_ids
+    )
+    version_ids = {
+        version_entity["id"]
+        for version_entity in versions_by_product_id.values()
+        if version_entity["taskId"] == task_id
+    }
+    if not version_ids:
+        return None
+
+    for representation_entity in get_representations(
+        project_name,
+        version_ids=version_ids,
+    ):
+        if workfile_extensions is None:
+            return representation_entity
+        ext = representation_entity["context"].get("ext")
+        if not ext:
+            continue
+        if ".{}".format(ext) in workfile_extensions:
+            return representation_entity
+    return None
 
 
 def get_linked_representation_id(

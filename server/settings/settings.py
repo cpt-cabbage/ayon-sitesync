@@ -25,6 +25,25 @@ class GeneralSubmodel(BaseSettingsModel):
                                             title="Always accessible on sites")
     active_site: str = Field("studio", title="User Default Active Site")
     remote_site: str = Field("studio", title="User Default Remote Site")
+    enable_auto_download: bool = Field(
+        True,
+        title="Auto-download assigned work",
+        description="On remote machines, automatically download the last"
+                    " published workfile of each task assigned to the"
+                    " logged-in user, plus the representations it"
+                    " references."
+    )
+    auto_download_interval: int = Field(
+        300,
+        title="Auto-download check interval (s)",
+        description="How often to look for new assigned work to download."
+    )
+    min_free_space_gb: int = Field(
+        5,
+        title="Auto-download minimum free space (GB)",
+        description="Skip auto-download when free disk space under the"
+                    " local roots drops below this."
+    )
 
 
 class RootSubmodel(BaseSettingsModel):

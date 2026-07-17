@@ -1,13 +1,7 @@
 import os
 import shutil
 
-from ayon_api import (
-    get_representations,
-    get_products,
-    get_last_versions
-)
-
-from ayon_core.lib import is_func_signature_supported
+from ayon_core.lib import filter_profiles
 from ayon_core.pipeline.template_data import get_template_data
 from ayon_core.pipeline.workfile import get_workfile_template_key
 from ayon_core.pipeline.workfile import should_use_last_workfile_on_launch
@@ -15,6 +9,7 @@ from ayon_core.pipeline.workfile import should_use_last_workfile_on_launch
 from ayon_applications import PreLaunchHook
 
 from ayon_sitesync.sitesync import download_last_published_workfile
+from ayon_sitesync.utils import get_last_published_workfile_representation
 
 
 class CopyLastPublishedWorkfile(PreLaunchHook):
@@ -30,7 +25,9 @@ class CopyLastPublishedWorkfile(PreLaunchHook):
     app_groups = ["blender", "photoshop", "tvpaint", "aftereffects",
                   "nuke", "nukeassist", "nukex", "hiero", "nukestudio",
                   "maya", "harmony", "celaction", "flame", "fusion",
-                  "houdini", "tvpaint"]
+                  "houdini", "resolve", "unreal", "substancepainter",
+                  "substancedesigner", "motionbuilder", "gaffer",
+                  "openrv", "premiere"]
 
     def execute(self):
         """Check if local workfile doesn't exist, else copy it.
@@ -118,12 +115,23 @@ class CopyLastPublishedWorkfile(PreLaunchHook):
             )
             return
 
+        # 'should_use_last_workfile_on_launch' only returns the profile's
+        # 'enabled' flag; the profile's dedicated
+        # 'use_last_published_workfile' toggle was read nowhere in core,
+        # so turning it off in Studio Settings did nothing. Honor it here.
+        if not self._use_last_published_workfile_enabled(
+            host_name, task_name, task_type, project_settings
+        ):
+            self.log.info(
+                f'Profile for host "{host_name}" disables using last'
+                " published workfile as first workfile."
+            )
+            return
+
         self.log.info("Trying to fetch last published workfile...")
 
-        workfile_representation = (
-            self._get_last_published_workfile_representation(
-                project_name, folder_id, task_id, workfile_extensions
-            )
+        workfile_representation = get_last_published_workfile_representation(
+            project_name, folder_id, task_id, workfile_extensions
         )
 
         if not workfile_representation:
@@ -180,50 +188,34 @@ class CopyLastPublishedWorkfile(PreLaunchHook):
         # Keep source filepath for further path conformation
         self.data["source_filepath"] = last_published_workfile_path
 
-    def _get_last_published_workfile_representation(self,
-        project_name, folder_id, task_id, workfile_extensions
+    def _use_last_published_workfile_enabled(
+        self, host_name, task_name, task_type, project_settings
     ):
-        """Looks for last published representation for host and context"""
+        """Read the profile's 'use_last_published_workfile' toggle.
 
-        kwargs = dict(
-            folder_ids={folder_id},
-            product_base_types={"workfile"},
+        Missing settings structures default to enabled - matching the
+        profile field's own default.
+        """
+        try:
+            profiles = (
+                project_settings
+                ["core"]
+                ["tools"]
+                ["Workfiles"]
+                ["last_workfile_on_startup"]
+            )
+        except (KeyError, TypeError):
+            return True
+        if not profiles:
+            return True
+        matching_profile = filter_profiles(
+            profiles,
+            {
+                "task_names": task_name,
+                "task_types": task_type,
+                "host_names": host_name,
+            }
         )
-        # TODO add requirement for AYON launcher 1.4.3 when removed
-        if not is_func_signature_supported(
-            get_products, project_name, **kwargs
-        ):
-            kwargs["product_types"] = kwargs.pop("product_base_types")
-
-        product_entities = get_products(project_name, **kwargs)
-
-        product_ids = {
-            product_entity["id"]
-            for product_entity in product_entities
-        }
-        if not product_ids:
-            return None
-
-        versions_by_product_id = get_last_versions(
-            project_name,
-            product_ids
-        )
-        version_ids = {
-            version_entity["id"]
-            for version_entity in versions_by_product_id.values()
-            if version_entity["taskId"] == task_id
-        }
-        if not version_ids:
-            return None
-
-        for representation_entity in get_representations(
-            project_name,
-            version_ids=version_ids,
-        ):
-            ext = representation_entity["context"].get("ext")
-            if not ext:
-                continue
-            ext = f".{ext}"
-            if ext in workfile_extensions:
-                return representation_entity
-        return None
+        if not matching_profile:
+            return True
+        return matching_profile.get("use_last_published_workfile", True)

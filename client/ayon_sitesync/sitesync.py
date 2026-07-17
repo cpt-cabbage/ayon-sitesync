@@ -15,6 +15,7 @@ from ayon_core.pipeline.load import get_representation_path_with_anatomy
 
 from .providers import lib
 from .utils import SyncStatus, ResumableError, get_linked_representation_id
+from .auto_download import AutoDownloader
 
 
 async def upload(
@@ -334,6 +335,7 @@ class SiteSyncThread(threading.Thread):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
         self.timer = None
         self._warned_keys = set()
+        self.auto_downloader = AutoDownloader(addon)
 
     def run(self):
         self.is_running = True
@@ -380,6 +382,10 @@ class SiteSyncThread(threading.Thread):
                     # in its constructor, transient DB error) must not stop
                     # syncing for every other project - contain it here.
                     try:
+                        # Queue missing assigned-task work first (throttled
+                        # internally, never raises) so this very loop pass
+                        # picks the new downloads up.
+                        self.auto_downloader.process_project(project_name)
                         await self._sync_project(project_name)
                     except asyncio.exceptions.CancelledError:
                         raise
