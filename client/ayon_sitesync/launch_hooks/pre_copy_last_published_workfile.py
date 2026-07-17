@@ -11,6 +11,7 @@ from ayon_applications import PreLaunchHook
 from ayon_sitesync.sitesync import download_last_published_workfile
 from ayon_sitesync.task_tracking import record_opened_task
 from ayon_sitesync.utils import get_last_published_workfile_representation
+from ayon_sitesync.workarea_mirror import mirror_workarea_files
 
 
 class CopyLastPublishedWorkfile(PreLaunchHook):
@@ -128,6 +129,39 @@ class CopyLastPublishedWorkfile(PreLaunchHook):
                 f' Can\'t access custom templates in host "{host_name}".'
             )
             return
+
+        # Prefer the artist's actual work-area scenes: fetch the task's
+        # workfiles from the studio share by direct copy (work-area files
+        # are not representations, sitesync can't transfer them) and open
+        # the newest one. Falls through to the published-workfile flow
+        # when the share is unreachable or the task has no work-area
+        # workfile yet.
+        sitesync_settings = sitesync_addon.get_sync_project_setting(
+            project_name
+        )
+        if (sitesync_settings["config"] or {}).get(
+            "mirror_workarea_workfiles", True
+        ):
+            try:
+                workarea_paths = mirror_workarea_files(
+                    sitesync_addon,
+                    project_name,
+                    [self.data["task_entity"]["id"]],
+                    workfile_extensions,
+                )
+            except Exception:
+                self.log.warning(
+                    "Work-area workfile fetch failed", exc_info=True
+                )
+                workarea_paths = []
+            if workarea_paths:
+                newest_path = workarea_paths[-1]
+                self.log.info(
+                    "Using newest work-area workfile: {}".format(
+                        newest_path)
+                )
+                self.data["last_workfile_path"] = newest_path
+                return
 
         # 'should_use_last_workfile_on_launch' only returns the profile's
         # 'enabled' flag; the profile's dedicated

@@ -52,6 +52,14 @@ class GeneralSubmodel(BaseSettingsModel):
                     " days after the last open. 0 disables opened-task"
                     " tracking."
     )
+    mirror_workarea_workfiles: bool = Field(
+        True,
+        title="Fetch work-area workfiles from studio",
+        description="On remote machines with the studio share reachable"
+                    " (VPN), copy missing work-area workfiles of assigned"
+                    " and opened tasks to the local site by direct file"
+                    " copy. Existing local files are never overwritten."
+    )
 
 
 class RootSubmodel(BaseSettingsModel):

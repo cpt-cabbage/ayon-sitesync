@@ -27,6 +27,12 @@ reachable, and asks again next time.
   Maya, Houdini, Nuke or Blender on a task and the scene seeds itself
   from the last published workfile; opening any shot once keeps it
   syncing for the next two weeks (studio-configurable).
+- **Your scenes come with you.** Work-area workfiles (the scenes you and
+  your teammates save, published or not) of your assigned and opened
+  tasks are copied from the studio share to your machine whenever the
+  share is reachable (VPN up) — so the Workfiles list isn't greyed out
+  and launching a task opens your newest scene. Your local files are
+  never overwritten by this.
 - **Publishing uploads itself.** When you publish, the files transfer to
   the studio in the background, starting within seconds.
 - **Loading something new downloads it.** Products you download via the
@@ -74,3 +80,6 @@ The tray has a **Site Sync** submenu:
   (configurable by the studio) and tells you in the log.
 - Removing something from your local site (Loader → *Remove from local*)
   is respected: it will not be auto-downloaded again.
+- Work-area scene fetching needs the studio share reachable (VPN). Fully
+  offline, only *published* files can move — publishing is how your work
+  gets back to the studio.

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 
 import ayon_api
@@ -31,6 +32,7 @@ from ayon_core.lib import Logger, get_local_site_id
 
 from .machine_role import get_machine_pref
 from .task_tracking import get_tracked_tasks
+from .workarea_mirror import mirror_workarea_files
 from .utils import (
     SiteAlreadyPresentError,
     SiteSyncStatus,
@@ -56,6 +58,7 @@ class AutoDownloader:
         self._ledger = None
         self._username = None
         self._disk_warned_projects = set()
+        self._mirror_thread = None
 
     def process_project(self, project_name):
         """Queue missing assigned-task dependencies for download.
@@ -102,7 +105,18 @@ class AutoDownloader:
         # Stamp before the work so failures don't retry in a hot loop.
         self._last_run_by_project[project_name] = now
 
-        candidate_ids = self._collect_candidates(project_name, config)
+        folder_id_by_task_id = self._get_relevant_tasks(
+            project_name, config
+        )
+
+        if config.get("mirror_workarea_workfiles", True):
+            self._mirror_workarea(
+                project_name, set(folder_id_by_task_id)
+            )
+
+        candidate_ids = self._collect_candidates(
+            project_name, folder_id_by_task_id
+        )
         ledger = self._get_project_ledger(project_name)
         fresh_ids = [
             repre_id for repre_id in candidate_ids
@@ -148,12 +162,15 @@ class AutoDownloader:
             )
         self._save_ledger()
 
-    def _collect_candidates(self, project_name, config):
-        """Last published workfile + referenced repres per relevant task.
+    def _get_relevant_tasks(self, project_name, config):
+        """Tasks whose content should live on this machine.
 
         Relevant = tasks assigned to the logged-in user, unioned with
         tasks the artist opened on this machine (tracked by the launch
         hook, expiring per 'opened_task_retention_days').
+
+        Returns:
+            dict[str, str]: task_id -> folder_id.
         """
         folder_id_by_task_id = {}
 
@@ -172,7 +189,37 @@ class AutoDownloader:
         folder_id_by_task_id.update(
             get_tracked_tasks(project_name, retention_days)
         )
+        return folder_id_by_task_id
 
+    def _mirror_workarea(self, project_name, task_ids):
+        """Fetch missing work-area workfiles by direct copy, off-loop.
+
+        Copies can be large - they run in their own thread so the sync
+        loop keeps transferring representations meanwhile. One mirror
+        thread at a time; a busy thread just skips this pass.
+        """
+        if not task_ids:
+            return
+        if self._mirror_thread is not None and self._mirror_thread.is_alive():
+            return
+
+        def _run():
+            try:
+                mirror_workarea_files(
+                    self.addon, project_name, task_ids
+                )
+            except Exception:
+                log.warning(
+                    "Work-area mirror failed for '{}'".format(
+                        project_name),
+                    exc_info=True
+                )
+
+        self._mirror_thread = threading.Thread(target=_run, daemon=True)
+        self._mirror_thread.start()
+
+    def _collect_candidates(self, project_name, folder_id_by_task_id):
+        """Last published workfile + referenced repres per relevant task."""
         candidate_ids = set()
         for task_id, folder_id in folder_id_by_task_id.items():
             repre = get_last_published_workfile_representation(

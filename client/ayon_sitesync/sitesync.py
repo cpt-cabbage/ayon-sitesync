@@ -495,9 +495,16 @@ class SiteSyncThread(threading.Thread):
         without deduplication a persistent problem floods the log until the
         real message drowns.
         """
-        if key not in self._warned_keys:
-            self._warned_keys.add(key)
-            self.log.warning(message, exc_info=exc_info)
+        if key in self._warned_keys:
+            return
+        self._warned_keys.add(key)
+        # never pass exc_info=False through: logging stores the literal
+        # False on the record and ayon-core's formatter subscripts
+        # record.exc_info -> TypeError ('bool' object is not subscriptable)
+        if exc_info:
+            self.log.warning(message, exc_info=True)
+        else:
+            self.log.warning(message)
 
     def _working_sites(self, project_name, sync_config):
         if self.addon.is_project_paused(project_name):
@@ -527,41 +534,38 @@ class SiteSyncThread(threading.Thread):
                 )
                 return None, None
 
-        try:
-            sites_working = all([
-                _site_is_working(
-                    self.addon, project_name, local_site,
-                    sites_config[local_site]
-                ),
-                _site_is_working(
-                    self.addon, project_name, remote_site,
-                    sites_config[remote_site]
+        # Check each site separately so the warning can name the culprit.
+        for site_name in (local_site, remote_site):
+            try:
+                site_working = _site_is_working(
+                    self.addon, project_name, site_name,
+                    sites_config[site_name]
                 )
-            ])
-        except Exception:
-            # Provider handlers (e.g. rclone) may raise from their
-            # constructor on bad configuration - degrade to "site not
-            # working" instead of letting it crash the loop.
-            self._warn_once(
-                (project_name, local_site, remote_site, "provider_error"),
-                (
-                    "Misconfigured provider for sites {} - {} in project"
-                    " '{}', skipping the project."
-                ).format(local_site, remote_site, project_name),
-                exc_info=True
-            )
-            return None, None
-
-        if not sites_working:
-            self._warn_once(
-                (project_name, local_site, remote_site, "not_working"),
-                (
-                    "Some of the sites {} - {} in {} is not working properly"
-                    " (missing credentials, unreachable root or misconfigured"
-                    " provider) - project is skipped until it recovers."
-                ).format(local_site, remote_site, project_name)
-            )
-            return None, None
+            except Exception:
+                # Provider handlers (e.g. rclone) may raise from their
+                # constructor on bad configuration - degrade to "site not
+                # working" instead of letting it crash the loop.
+                self._warn_once(
+                    (project_name, site_name, "provider_error"),
+                    (
+                        "Misconfigured provider for site '{}' in project"
+                        " '{}', skipping the project."
+                    ).format(site_name, project_name),
+                    exc_info=True
+                )
+                return None, None
+            if not site_working:
+                self._warn_once(
+                    (project_name, site_name, "not_working"),
+                    (
+                        "Site '{}' of project '{}' is not working"
+                        " (unreachable root, missing credentials or"
+                        " misconfigured provider) - project is skipped"
+                        " until it recovers. Look for a 'root' warning"
+                        " above naming the exact path."
+                    ).format(site_name, project_name)
+                )
+                return None, None
 
         return local_site, remote_site
 
