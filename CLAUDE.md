@@ -166,6 +166,37 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (`1.3.1+ls.0.9.0`): work-area workfile mirror + log fixes
+
+**Why a mirror and not the sitesync DB** (asked and answered - keep this
+rationale): `sitesync_files_status` is representation-keyed at every layer
+(schema, endpoints, loop status-pair matching, retry/progress, UI) and its
+state machine assumes files are immutable once OK - work-area files mutate
+on every save. Expanding it means a parallel schema + endpoints + loop + UI
+(the old §2 "option 3", a permanent upstream divergence). Instead
+`workarea_mirror.py` uses AYON's **workfile entities** (already the
+server-side index of work-area files, rootless-path-keyed) as the database
+and the filesystem as the state: missing locally ⇒ direct copy over the
+reachable share; existing local files are NEVER overwritten (local edits
+win; publishing remains the transfer medium back). Idempotent, no
+bookkeeping; limitation: needs the share reachable (probed with timeout),
+download-only, no progress rows in the queue window.
+
+- `AutoDownloader`: `_get_relevant_tasks` extracted; `_mirror_workarea`
+  runs `mirror_workarea_files` in its own thread (copies can be huge; one
+  at a time, busy = skip pass). Gated by new `mirror_workarea_workfiles`
+  setting (default on).
+- Launch hook: before the published-workfile flow, mirror the task's
+  work-area workfiles (host extensions only) and open the newest -
+  published seeding is now the fallback for share-unreachable/no-workfile
+  cases. This also fixes "opening a task triggered nothing" when the task
+  had no *published* workfile.
+- `_warn_once` fix: never pass `exc_info=False` into logging - the literal
+  False lands on `record.exc_info` and ayon-core's formatter subscripts it
+  (`TypeError: 'bool' object is not subscriptable`). Branch on it instead.
+- `_working_sites` now checks each site separately and names the failing
+  site in its warning (was one merged "some of the sites" message).
+
 ## Added on `luma` (`1.3.1+ls.0.8.0`): live sync-queue visibility
 
 - **Tray "Show sync queue…" window** (`tray_queue_window.py`,
