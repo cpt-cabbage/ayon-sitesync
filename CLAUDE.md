@@ -166,6 +166,20 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (`1.3.1+ls.0.5.0`): web-page error visibility + retry
+
+The web frontend was 100% read-only; failures showed a truncated message with
+no way to read it or act on it.
+
+- New server endpoint `POST /{project}/state/resetFailed?siteName=` (+optional
+  `representationId`): transactionally flips FAILED files back to QUEUED and
+  clears `retries`/`message`; recomputes the roll-up status. Serves both the
+  per-representation Retry (detail dialog footer) and the toolbar "Retry all
+  failed" (summary), each POSTing once per selected site. This is the ONLY
+  mutating call the frontend makes - keep new frontend actions going through
+  dedicated server endpoints rather than reconstructing file payloads in JS.
+- `formatStatus` shows the stored failure message wrapped + in a tooltip.
+
 ## Added on `luma` (`1.3.1+ls.0.4.0`): tray menu, notifications, doctor
 
 The tray finally has a face (`tray_menu` was `pass`):
