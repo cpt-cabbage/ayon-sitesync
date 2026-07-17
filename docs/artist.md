@@ -36,6 +36,9 @@ reachable, and asks again next time.
 
 The tray has a **Site Sync** submenu:
 
+- **Show sync queue…** — a live window of everything queued,
+  transferring (with progress) or failed on this machine, with a
+  one-click *Retry all failed*.
 - **Sync now** — don't wait for the next background pass.
 - **Pause syncing** — temporarily stop **all** transfers, uploads
   included (e.g. on a bad connection). Uncheck to resume immediately.
@@ -53,7 +56,10 @@ The tray has a **Site Sync** submenu:
   project per 5 minutes) and the file reads **Failed** on the web status
   page, with the error text shown in full on hover.
 - On the web page you can **Retry all failed** (toolbar) or open a
-  representation's detail and **Retry failed files**.
+  representation's detail and **Retry failed files**. Progress bars on
+  the web page update live while transfers run.
+- The tray's **Show sync queue…** window shows the same live picture
+  without leaving the desktop.
 - If Site Sync tells you a **hidden override disables it for this
   machine**, send that message to your admin — it is a known server-side
   trap they can remove in a minute (see the admin guide).

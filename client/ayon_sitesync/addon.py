@@ -126,6 +126,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         # throttle for tray failure notifications, per project
         self._last_notification_by_project = {}
         self._pause_action = None
+        self._queue_window = None
 
         # zero-touch machine role, resolved once per process per project -
         # a role flip mid-session would change every resolved path
@@ -1455,6 +1456,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
         menu.addSeparator()
 
+        queue_action = QtWidgets.QAction("Show sync queue...", menu)
+        queue_action.triggered.connect(self._on_tray_show_queue)
+        menu.addAction(queue_action)
+
         validate_action = QtWidgets.QAction(
             "Adopt existing local files", menu
         )
@@ -1474,6 +1479,18 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
     def _on_tray_sync_now(self):
         self.log.info("Manual sync requested from tray")
         self.reset_timer()
+
+    def _on_tray_show_queue(self):
+        try:
+            if self._queue_window is None:
+                from .tray_queue_window import SyncQueueWindow
+
+                self._queue_window = SyncQueueWindow(self)
+            self._queue_window.show()
+            self._queue_window.raise_()
+            self._queue_window.activateWindow()
+        except Exception:
+            self.log.warning("Couldn't open sync queue window", exc_info=True)
 
     def _on_tray_pause_toggle(self, checked=False):
         if checked:

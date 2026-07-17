@@ -108,6 +108,30 @@ const SiteSyncSummary = ({
     // eslint-disable-next-line
   }, [lazyParams])
 
+  // live progress: while any visible row is transferring, silently
+  // re-poll so the progress bars actually move (the client writes
+  // progress to the DB every ~5s)
+  useEffect(() => {
+    const anyInProgress = representations.some(
+      (repre) =>
+        repre.localStatus.status === 0 || repre.remoteStatus.status === 0
+    )
+    if (!anyInProgress) return
+
+    const timer = setInterval(() => {
+      axios
+        .get(baseUrl + buildQueryString(selectedLocalSite,
+                                        selectedRemoteSite,
+                                        lazyParams))
+        .then((response) => {
+          setRepresentations(response.data.representations)
+        })
+        .catch(() => {})
+    }, 5000)
+    return () => clearInterval(timer)
+    // eslint-disable-next-line
+  }, [representations])
+
   const updateSite = (event, site_type) => {
     /* Updates site after selection change, triggers refresh.*/
     if (site_type == "local"){
