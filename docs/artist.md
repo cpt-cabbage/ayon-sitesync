@@ -20,11 +20,13 @@ reachable, and asks again next time.
 
 ## What happens automatically on a remote machine
 
-- **Your assigned work downloads itself.** The latest published workfile
-  of every task assigned to you — plus the files it references — is
-  fetched in the background (checked every 5 minutes by default). Launch
+- **Your work downloads itself.** The latest published workfile — plus
+  the files it references — is fetched in the background (checked every
+  5 minutes by default) for every task **assigned to you** and every
+  task **you have opened** on this machine, assigned or not. Launch
   Maya, Houdini, Nuke or Blender on a task and the scene seeds itself
-  from the last published workfile.
+  from the last published workfile; opening any shot once keeps it
+  syncing for the next two weeks (studio-configurable).
 - **Publishing uploads itself.** When you publish, the files transfer to
   the studio in the background, starting within seconds.
 - **Loading something new downloads it.** Products you download via the
@@ -35,8 +37,11 @@ reachable, and asks again next time.
 The tray has a **Site Sync** submenu:
 
 - **Sync now** — don't wait for the next background pass.
-- **Pause syncing** — temporarily stop all transfers (e.g. on a bad
-  connection). Uncheck to resume immediately.
+- **Pause syncing** — temporarily stop **all** transfers, uploads
+  included (e.g. on a bad connection). Uncheck to resume immediately.
+- **Auto-download new work** — uncheck to stop background downloads
+  only; your own publishes still upload. This is the switch to use when
+  you don't want opened/assigned tasks pulling files to this machine.
 - **Adopt existing local files** — if you already have files on disk
   (copied by hand, restored from a backup), this marks them as synced so
   they are not downloaded again.

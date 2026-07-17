@@ -34,23 +34,45 @@ def _get_role_file_path():
     return get_launcher_local_dir(_ROLE_FILE_NAME)
 
 
+def _read_prefs():
+    try:
+        path = _get_role_file_path()
+        if os.path.exists(path):
+            with open(path, "r") as stream:
+                return json.load(stream)
+    except Exception:
+        log.warning("Couldn't read machine prefs file", exc_info=True)
+    return {}
+
+
+def _write_prefs(content):
+    path = _get_role_file_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as stream:
+        json.dump(content, stream)
+
+
+def get_machine_pref(key, default=None):
+    """Per-machine sitesync preference (artist-local, not server)."""
+    return _read_prefs().get(key, default)
+
+
+def set_machine_pref(key, value):
+    """Persist a per-machine sitesync preference."""
+    content = _read_prefs()
+    content[key] = value
+    _write_prefs(content)
+
+
 def get_saved_machine_role():
     """Role stored by the one-time tray prompt, or None if never answered.
 
     Returns:
         Union[str, None]: 'studio', 'remote' or None.
     """
-    try:
-        path = _get_role_file_path()
-        if not os.path.exists(path):
-            return None
-        with open(path, "r") as stream:
-            content = json.load(stream)
-        role = content.get("role")
-        if role in (ROLE_STUDIO, ROLE_REMOTE):
-            return role
-    except Exception:
-        log.warning("Couldn't read machine role file", exc_info=True)
+    role = get_machine_pref("role")
+    if role in (ROLE_STUDIO, ROLE_REMOTE):
+        return role
     return None
 
 
@@ -58,10 +80,7 @@ def save_machine_role(role):
     """Persist the machine role answered in the tray prompt."""
     if role not in (ROLE_STUDIO, ROLE_REMOTE):
         raise ValueError("Invalid machine role '{}'".format(role))
-    path = _get_role_file_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as stream:
-        json.dump({"role": role}, stream)
+    set_machine_pref("role", role)
     log.info("Machine role saved as '{}'".format(role))
 
 

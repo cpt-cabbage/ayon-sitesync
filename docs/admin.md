@@ -13,8 +13,11 @@ setup is three steps.
    defined for the studio-share workflow — `studio` and each artist's
    machine (`local`) always exist.
 3. Optionally tune *Site Sync → Config*:
-    - `Auto-download assigned work` (default on), its interval and the
-      minimum-free-space guard.
+    - `Auto-download assigned work` (default on), its interval, the
+      minimum-free-space guard, and `Keep opened tasks synced for
+      (days)` — how long a task an artist opened (assigned or not)
+      keeps auto-downloading new published work (default 14; 0 turns
+      opened-task tracking off).
     - `Loop Delay` / `Retry Count` for the transfer loop.
     - `User Default Active/Remote Site` — leave both at `studio`; the
       zero-touch logic handles remote machines. Set them explicitly only

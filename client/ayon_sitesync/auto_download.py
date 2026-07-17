@@ -29,6 +29,8 @@ import time
 import ayon_api
 from ayon_core.lib import Logger, get_local_site_id
 
+from .machine_role import get_machine_pref
+from .task_tracking import get_tracked_tasks
 from .utils import (
     SiteAlreadyPresentError,
     SiteSyncStatus,
@@ -77,6 +79,9 @@ class AutoDownloader:
         config = settings["config"]
         if not config.get("enable_auto_download", True):
             return
+        # artist-local off switch (tray: 'Auto-download new work')
+        if not get_machine_pref("auto_download", True):
+            return
         if addon.is_project_paused(project_name):
             return
 
@@ -97,7 +102,7 @@ class AutoDownloader:
         # Stamp before the work so failures don't retry in a hot loop.
         self._last_run_by_project[project_name] = now
 
-        candidate_ids = self._collect_candidates(project_name)
+        candidate_ids = self._collect_candidates(project_name, config)
         ledger = self._get_project_ledger(project_name)
         fresh_ids = [
             repre_id for repre_id in candidate_ids
@@ -143,20 +148,35 @@ class AutoDownloader:
             )
         self._save_ledger()
 
-    def _collect_candidates(self, project_name):
-        """Last published workfile + referenced repres per assigned task."""
+    def _collect_candidates(self, project_name, config):
+        """Last published workfile + referenced repres per relevant task.
+
+        Relevant = tasks assigned to the logged-in user, unioned with
+        tasks the artist opened on this machine (tracked by the launch
+        hook, expiring per 'opened_task_retention_days').
+        """
+        folder_id_by_task_id = {}
+
         username = self._get_username()
-        if not username:
-            return set()
-        tasks = list(ayon_api.get_tasks(
-            project_name,
-            assignees=[username],
-            fields={"id", "folderId"}
-        ))
+        if username:
+            for task in ayon_api.get_tasks(
+                project_name,
+                assignees=[username],
+                fields={"id", "folderId"}
+            ):
+                folder_id_by_task_id[task["id"]] = task["folderId"]
+
+        retention_days = float(
+            config.get("opened_task_retention_days", 14) or 0
+        )
+        folder_id_by_task_id.update(
+            get_tracked_tasks(project_name, retention_days)
+        )
+
         candidate_ids = set()
-        for task in tasks:
+        for task_id, folder_id in folder_id_by_task_id.items():
             repre = get_last_published_workfile_representation(
-                project_name, task["folderId"], task["id"]
+                project_name, folder_id, task_id
             )
             if not repre:
                 continue

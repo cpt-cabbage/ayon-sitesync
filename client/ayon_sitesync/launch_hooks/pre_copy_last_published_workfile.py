@@ -9,6 +9,7 @@ from ayon_core.pipeline.workfile import should_use_last_workfile_on_launch
 from ayon_applications import PreLaunchHook
 
 from ayon_sitesync.sitesync import download_last_published_workfile
+from ayon_sitesync.task_tracking import record_opened_task
 from ayon_sitesync.utils import get_last_published_workfile_representation
 
 
@@ -55,6 +56,19 @@ class CopyLastPublishedWorkfile(PreLaunchHook):
         ):
             self.log.debug("Sync server module is not enabled or available")
             return
+
+        # Opening a task expresses interest in it: track it so the
+        # auto-download service keeps this shot and its dependencies
+        # synced, assigned or not. Recorded before any early return below
+        # (existing workfile, disabled seeding, ...) and never fatal.
+        try:
+            record_opened_task(
+                project_name,
+                self.data["task_entity"]["id"],
+                self.data["folder_entity"]["id"],
+            )
+        except Exception:
+            self.log.warning("Couldn't track opened task", exc_info=True)
 
         # Check there is no workfile available
         last_workfile = self.data.get("last_workfile_path")

@@ -31,7 +31,9 @@ from .machine_role import (
     ROLE_REMOTE,
     get_saved_machine_role,
     get_default_local_root_base,
+    get_machine_pref,
     probe_machine_role,
+    set_machine_pref,
 )
 
 from .utils import (
@@ -1434,6 +1436,23 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         menu.addAction(pause_action)
         self._pause_action = pause_action
 
+        auto_download_action = QtWidgets.QAction(
+            "Auto-download new work", menu
+        )
+        auto_download_action.setCheckable(True)
+        auto_download_action.setChecked(
+            bool(get_machine_pref("auto_download", True))
+        )
+        auto_download_action.setToolTip(
+            "Automatically download published work for your assigned and"
+            " recently opened tasks. Uncheck to stop background"
+            " downloads; your own publishes still upload."
+        )
+        auto_download_action.triggered.connect(
+            self._on_tray_auto_download_toggle
+        )
+        menu.addAction(auto_download_action)
+
         menu.addSeparator()
 
         validate_action = QtWidgets.QAction(
@@ -1463,6 +1482,20 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             self.unpause_server()
             # resume immediately instead of waiting out the pause poll
             self.reset_timer()
+
+    def _on_tray_auto_download_toggle(self, checked=False):
+        try:
+            set_machine_pref("auto_download", bool(checked))
+            self.log.info(
+                "Auto-download turned {} from tray".format(
+                    "on" if checked else "off")
+            )
+            if checked:
+                self.reset_timer()
+        except Exception:
+            self.log.warning(
+                "Couldn't persist auto-download preference", exc_info=True
+            )
 
     def _on_tray_validate(self):
         """Schedule 'adopt existing local files' for enabled projects.

@@ -44,6 +44,14 @@ class GeneralSubmodel(BaseSettingsModel):
         description="Skip auto-download when free disk space under the"
                     " local roots drops below this."
     )
+    opened_task_retention_days: int = Field(
+        14,
+        title="Keep opened tasks synced for (days)",
+        description="Tasks an artist opened (assigned or not) keep"
+                    " auto-downloading new published work for this many"
+                    " days after the last open. 0 disables opened-task"
+                    " tracking."
+    )
 
 
 class RootSubmodel(BaseSettingsModel):
