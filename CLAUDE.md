@@ -166,6 +166,26 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (`1.3.1+ls.0.7.0`): opened-task tracking + artist off-switch
+
+- **Opening a task tracks it for auto-download**, assigned or not: the
+  launch hook calls `task_tracking.record_opened_task` (before ANY of its
+  early returns - tracking must happen even when the work area already has a
+  workfile or seeding is disabled). `AutoDownloader._collect_candidates`
+  unions tracked tasks with assigned ones. Entries expire
+  `opened_task_retention_days` (new `config` setting, default 14, 0 = off)
+  after the last open; re-opening refreshes the timestamp. Store:
+  `<launcher_local_dir>/sitesync_tracked_tasks.json`, written from
+  launcher/DCC processes, read by the tray - keep it lock-free
+  last-writer-wins, and keep it py3.7-safe (DCC pythons import it).
+- **Artist-local auto-download switch**: tray "Auto-download new work"
+  (checkable) persists `auto_download` in the machine prefs file (the role
+  file, `sitesync_machine_role.json`, generalized to
+  `get_machine_pref`/`set_machine_pref`). It only stops background
+  *downloads*; "Pause syncing" stops everything including publish uploads.
+  The server-side `enable_auto_download` remains the studio-wide kill
+  switch; the two AND together.
+
 ## Added on `luma` (`1.3.1+ls.0.5.0`): web-page error visibility + retry
 
 The web frontend was 100% read-only; failures showed a truncated message with
