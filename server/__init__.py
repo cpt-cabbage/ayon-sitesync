@@ -583,10 +583,13 @@ def get_overal_status(files: dict) -> StatusEnum:
         return StatusEnum.NOT_AVAILABLE
     elif all(stat == StatusEnum.SYNCED for stat in all_states):
         return StatusEnum.SYNCED
-    elif any(stat == StatusEnum.FAILED for stat in all_states):
-        return StatusEnum.FAILED
+    # IN_PROGRESS outranks FAILED: while anything is still transferring the
+    # representation is alive, and showing FAILED would mask the ongoing
+    # transfer. Once nothing moves anymore, any failed file wins.
     elif any(stat == StatusEnum.IN_PROGRESS for stat in all_states):
         return StatusEnum.IN_PROGRESS
+    elif any(stat == StatusEnum.FAILED for stat in all_states):
+        return StatusEnum.FAILED
     elif any(stat == StatusEnum.PAUSED for stat in all_states):
         return StatusEnum.PAUSED
     elif any(stat == StatusEnum.QUEUED for stat in all_states):
