@@ -1,3 +1,3 @@
 # -*- coding: utf-8 -*-
 """Package declaring AYON addon 'sitesync' version."""
-__version__ = "1.3.1+ls.0.1.0"
+__version__ = "1.3.1+ls.0.2.0"
