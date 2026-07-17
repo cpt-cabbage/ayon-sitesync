@@ -36,6 +36,9 @@ _QUEUE_REFRESH_MS = 4000
 _FILES_REFRESH_MS = 8000
 _SEARCH_DEBOUNCE_MS = 400
 _QUEUE_PAGE_LENGTH = 100
+# Upper bound of pages fetched per side per poll - only bounds a
+# pathological backlog (500+ active rows per side).
+_QUEUE_MAX_PAGES = 5
 _FILES_PAGE_LENGTH = 200
 
 _ACTIVE_STATUSES = (
@@ -164,21 +167,33 @@ def _collect_queue_rows(addon):
 
             merged = {}
             for side in ("local", "remote"):
-                kwargs = {
-                    "localSite": local_site,
-                    "remoteSite": remote_site,
-                    "pageLength": _QUEUE_PAGE_LENGTH,
-                    "{}StatusFilter".format(side): list(_ACTIVE_STATUSES),
-                }
-                response = ayon_api.get(
-                    "{}/{}/state".format(
-                        addon.endpoint_prefix, project_name),
-                    **kwargs
-                )
-                if response.status_code != 200:
-                    continue
-                for repre in response.data.get("representations") or []:
-                    merged[repre["representationId"]] = repre
+                # Page until a short page so a busy queue isn't silently
+                # truncated at one page; the page cap only bounds a
+                # pathological backlog.
+                for page in range(1, _QUEUE_MAX_PAGES + 1):
+                    kwargs = {
+                        "localSite": local_site,
+                        "remoteSite": remote_site,
+                        "page": page,
+                        "pageLength": _QUEUE_PAGE_LENGTH,
+                        "{}StatusFilter".format(side): (
+                            list(_ACTIVE_STATUSES)
+                        ),
+                    }
+                    response = ayon_api.get(
+                        "{}/{}/state".format(
+                            addon.endpoint_prefix, project_name),
+                        **kwargs
+                    )
+                    if response.status_code != 200:
+                        break
+                    rows_page = (
+                        response.data.get("representations") or []
+                    )
+                    for repre in rows_page:
+                        merged[repre["representationId"]] = repre
+                    if len(rows_page) < _QUEUE_PAGE_LENGTH:
+                        break
 
             for repre in merged.values():
                 rows.append(

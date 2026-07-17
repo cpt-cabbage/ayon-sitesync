@@ -38,6 +38,12 @@ class SyncStatusModel(OPModel):
     timestamp: int = Field(default_factory=time.time)
     message: str | None = Field(None)
     retries: int = Field(0)
+    # Live 0-1 fraction of a single file transfer. Clients post it every
+    # few seconds while a file is IN_PROGRESS (see providers'
+    # '_mark_progress'); it is stored per file and returned by the state
+    # endpoint so UIs can show within-file progress. None outside of an
+    # active transfer.
+    progress: float | None = Field(None)
 
 
 class SyncStatusPostModel(SyncStatusModel):

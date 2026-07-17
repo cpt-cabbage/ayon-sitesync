@@ -166,6 +166,96 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (unreleased, after opt-in): full-audit fix batch
+
+One batch implementing every actionable finding of the 2026-07-17 full
+audit. No version bump (user bumps explicitly). **Server and client must
+ship together** — the progress persistence and the client's explicit
+paging both assume the matching counterpart.
+
+Server (`server/__init__.py`, `settings/models.py`, `settings/settings.py`):
+
+- **SQL injection + crash-on-apostrophe fixed**: `localSite`/`remoteSite`
+  are regex-validated (`validate_site_name`, 400 on anything outside
+  `[A-Za-z0-9 _.-]`), `folderFilter`/`productFilter` go through
+  `escape_ilike` (quotes doubled, `\`/`%`/`_` escaped). The tray's
+  "All files" search feeds artist text straight into these — do not
+  reintroduce raw f-string interpolation for any new filter.
+- **Auth**: `CurrentUser` added to POST `state/{repre}/{site}` and GET
+  `state/representations` (the only two handlers without it);
+  `state/representations` now 400s without `representationIds`.
+- **Archived entities excluded**: the state and params queries filter
+  `active IS TRUE` on folder/product/version/representation — a
+  soft-deleted version stops syncing instead of transferring until its
+  hard delete cascades.
+- **Per-file `progress` persists** (see the corrected live-% section
+  below): `SyncStatusModel.progress`, stored only while IN_PROGRESS,
+  returned by `/state`.
+- **"Retry all failed" now matches rows with any FAILED file**, not only
+  rows whose roll-up is FAILED — the roll-up ranks IN_PROGRESS above
+  FAILED, so mixed rows used to be skipped.
+- Hardening: `size`/`timestamp` `or 0` guards (a repre file without size
+  500ed the whole state page), `data.files or {}`, params `count` now
+  counts DISTINCT names, `versionFilter is not None` (version 0 was
+  unfilterable), DDL in `check_sync_status_table` runs once per project
+  per server process (was 3 statements on every 4s tray poll).
+- **`get_user_sites` mirrors `_get_zero_touch_role` exactly**: synthesis
+  requires project `enabled`, BOTH `local_setting` sides unset
+  (all-or-nothing; a half-explicit pair resolves its unset side through
+  the project config, like the client), a degenerate project config pair,
+  site membership and `sync_enabled`. Keep the two implementations in
+  lock-step.
+- New setting `config.auto_download_link_depth` (default 2, 1–5).
+
+Client (`addon.py`, `auto_download.py`, `tray_control_window.py`,
+`plugins/publish/integrate_site_sync.py`):
+
+- **The 50-row default page is dead as a silent truncator**:
+  `_get_repres_state` chunks ids (100) and pages explicitly (fixes Loader
+  availability, adopt, auto-download state checks in one place);
+  `get_version_availability` and the repaired `get_repre_info_for_versions`
+  (its URL was a nonexistent route and its param misspelled — every call
+  404ed) chunk + page too; `get_sync_representations` passes
+  `pageLength=limit` so provider batch limits above 50 are real; the
+  queue tab pages up to `_QUEUE_MAX_PAGES`. **Any new `/state` caller
+  must pass `pageLength` and page explicitly.**
+- **`validate_project` ("Adopt existing local files") rewritten to be
+  per-file honest**: files on disk → OK, missing files keep their status
+  or become QUEUED (so the loop can complete a partial adopt), one
+  `force=True` POST per changed repre (also heals stale file-id rows),
+  one `reset_timer()` for the batch. The old version marked ALL files OK
+  when one existed and force-reset anything past the 50-row page —
+  actively corrupting state on real projects.
+- **`update_db` matches the transferred file by `id`, not `fileHash`** —
+  two identical files at different paths share a hash; the twin was
+  marked OK without ever being copied.
+- **`get_representations_sync_state` counts per-file OK + live fractions**
+  — an IN_PROGRESS repre at 25/26 files used to read 0.
+- **`handle_alternate_site` uses project-RESOLVED settings** (was the
+  unresolved studio fetch — same class of bug as the `enabled` veto fixed
+  in `+ls.0.0.2`; project-scoped `alternative_sites` were ignored on the
+  post-transfer propagation).
+- **`_remove_local_file` keeps files a sibling repre still holds**:
+  the integrator attaches version-level resources (textures) to EVERY
+  repre, so removing one repre used to delete files another repre of the
+  same version still had marked OK locally (`_get_paths_held_by_siblings`,
+  best-effort).
+- **`IntegrateSiteSync` survives version-overwrite republish**: catches
+  `SiteAlreadyPresentError` and retries `force=True` (repre ids survive
+  an overwrite but file ids regenerate — without the reset the publish
+  failed AND the stale record wedged the repre forever, since the server
+  skips unknown file ids on update).
+- **Auto-download**: follows `reference` links to
+  `auto_download_link_depth` (default 2 — a loaded asset's own linked
+  dependencies now come along); ledger pruned of deleted representations
+  once per project per tray session (`_prune_project_ledger`).
+
+NOT implemented (out of this repo / needs a product decision): Loader
+dependency-pull for non-workfile products (core hardcodes
+`product_type == "workfile"` — the USD layered/assembly gap), a poll
+timer in core's Manager/Loader UIs, local retention/GC of old downloads,
+priority UI. Farm renders still mark `studio=OK` only, by design.
+
 ## Added on `luma` (unreleased, after `0.9.0`): all-in-one sync control panel
 
 Versioning note: `package.py` deliberately NOT bumped — the user bumps
@@ -501,11 +591,21 @@ path.
 No-code alternative to this fix, if it is ever reverted: lower
 `sitesync → config → Loop Delay`, at the cost of constant polling from every tray.
 
-### Related: live progress % is available but nothing polls it
+### Related: live progress % — CORRECTED (was wrong until the audit-fix batch)
 
-`local_drive._mark_progress()` writes a real 0–1 fraction to the DB every
-`LOG_PROGRESS_SEC` (**5s**) during a transfer, comparing source vs target file
-size, for **both** directions:
+An earlier version of this section claimed `local_drive._mark_progress()`
+"writes a real 0–1 fraction to the DB". **That was false**: the client
+posted a `progress` key, but the server's `SyncStatusPostModel` had no such
+field and the POST handler copied only timestamp/status/size/message/retries
+— the fraction was silently dropped, upstream and here. Every progress UI
+was file-count granularity at best; a single-file repre read 0% until done.
+
+Fixed in the audit-fix batch (unreleased): `SyncStatusModel.progress`
+(`server/settings/models.py`) now persists the fraction (stored only while
+IN_PROGRESS, dropped on any other status) and the `/state` endpoint returns
+it per file, so `_mark_progress`'s 5s posts are finally real end-to-end.
+**Requires server AND client from the same build** — an old server drops
+the field again (harmlessly). For both directions:
 
 ```python
 side = "local"
@@ -513,13 +613,12 @@ if direction == "Upload":
     side = "remote"
 ```
 
-So **Download animates the *Active site* column, Upload the *Remote site* column**,
-and `get_representations_site_progress` returns both in one call — one refresh
-updates both; no separate window is needed.
+So **Download animates the *Active site* column, Upload the *Remote site*
+column** — one refresh updates both; no separate window is needed.
 
-Nothing displays it because the **UI never re-asks**: Scene Inventory refreshes
-once via `view.data_changed` (fired right after the click, *before* any bytes move)
-or the manual Refresh button. There is no poll timer.
+What still doesn't display it: the **core UI never re-asks**. Scene Inventory
+refreshes once via `view.data_changed` (fired right after the click, *before*
+any bytes move) or the manual Refresh button. There is no poll timer.
 
 **The Manager and Loader are `ayon-core` tools**, not sitesync — sitesync only
 supplies the data. So a poll timer (~5s while anything is in flight, stopped when

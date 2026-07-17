@@ -48,6 +48,13 @@ _LEDGER_FILE_NAME = "sitesync_autodownload.json"
 # keeps one giant backlog from starving actual transfers.
 MAX_QUEUED_PER_PASS = 50
 
+# Fallback for the 'auto_download_link_depth' server setting: how deep
+# to follow 'reference' links from a workfile. Depth 1 is what the
+# workfile loaded directly, depth 2 also pulls what those inputs
+# reference (e.g. a loaded asset's own linked dependencies). Deeper
+# nesting is rare and each level costs link queries per task.
+DEFAULT_LINK_DEPTH = 2
+
 
 class AutoDownloader:
     """Stateful helper owned by the sync thread."""
@@ -59,6 +66,8 @@ class AutoDownloader:
         self._username = None
         self._disk_warned_projects = set()
         self._mirror_thread = None
+        # projects whose ledger was already pruned this tray session
+        self._pruned_projects = set()
 
     def process_project(self, project_name):
         """Queue missing assigned-task dependencies for download.
@@ -115,9 +124,10 @@ class AutoDownloader:
             )
 
         candidate_ids = self._collect_candidates(
-            project_name, folder_id_by_task_id
+            project_name, folder_id_by_task_id, config
         )
         ledger = self._get_project_ledger(project_name)
+        self._prune_project_ledger(project_name, ledger)
         fresh_ids = [
             repre_id for repre_id in candidate_ids
             if repre_id not in ledger
@@ -218,8 +228,17 @@ class AutoDownloader:
         self._mirror_thread = threading.Thread(target=_run, daemon=True)
         self._mirror_thread.start()
 
-    def _collect_candidates(self, project_name, folder_id_by_task_id):
+    def _collect_candidates(self, project_name, folder_id_by_task_id, config):
         """Last published workfile + referenced repres per relevant task."""
+        try:
+            link_depth = int(
+                config.get("auto_download_link_depth")
+                or DEFAULT_LINK_DEPTH
+            )
+        except (TypeError, ValueError):
+            link_depth = DEFAULT_LINK_DEPTH
+        link_depth = max(link_depth, 1)
+
         candidate_ids = set()
         for task_id, folder_id in folder_id_by_task_id.items():
             repre = get_last_published_workfile_representation(
@@ -229,7 +248,7 @@ class AutoDownloader:
                 continue
             candidate_ids.add(repre["id"])
             candidate_ids.update(get_linked_representation_id(
-                project_name, repre, "reference"
+                project_name, repre, "reference", max_depth=link_depth
             ))
         return candidate_ids
 
@@ -297,6 +316,48 @@ class AutoDownloader:
                 log.warning("Couldn't resolve user name", exc_info=True)
                 return None
         return self._username
+
+    def _prune_project_ledger(self, project_name, ledger):
+        """Drop ledger ids whose representations no longer exist.
+
+        The ledger remembers every id ever auto-queued so artist removals
+        are respected - but without pruning it grows forever as versions
+        are deleted. Runs once per project per tray session; best-effort
+        (a failed prune just leaves the ledger as is).
+        """
+        if project_name in self._pruned_projects or not ledger:
+            return
+        self._pruned_projects.add(project_name)
+        try:
+            ledger_ids = list(ledger)
+            existing = set()
+            chunk_size = 500
+            for chunk_start in range(0, len(ledger_ids), chunk_size):
+                chunk = ledger_ids[chunk_start:chunk_start + chunk_size]
+                for repre in ayon_api.get_representations(
+                    project_name,
+                    representation_ids=chunk,
+                    fields={"id"}
+                ):
+                    existing.add(str(repre["id"]).replace("-", ""))
+            stale = {
+                repre_id for repre_id in ledger_ids
+                if str(repre_id).replace("-", "") not in existing
+            }
+            if stale:
+                ledger.difference_update(stale)
+                self._save_ledger()
+                log.info(
+                    "Pruned {} deleted representation(s) from the"
+                    " auto-download ledger of '{}'".format(
+                        len(stale), project_name)
+                )
+        except Exception:
+            log.warning(
+                "Couldn't prune auto-download ledger for '{}'".format(
+                    project_name),
+                exc_info=True
+            )
 
     # ledger -------------------------------------------------------------
     def _get_ledger_path(self):

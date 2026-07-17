@@ -1,10 +1,12 @@
 from __future__ import annotations
+import re
 from typing import Any, Type
 from nxtools import logging
 import os
 from fastapi import Path, Query, Response
 
 from ayon_server.addons import BaseServerAddon
+from ayon_server.exceptions import BadRequestException
 
 from ayon_server.access.utils import folder_access_list
 from ayon_server.api.dependencies import (
@@ -91,22 +93,30 @@ class SiteSync(BaseServerAddon):
     ) -> SiteSyncParamsModel:
 
         access_list = await folder_access_list(user, project_name, "read")
-        conditions = []
+        conditions = [
+            "r.active IS TRUE",
+            "v.active IS TRUE",
+            "p.active IS TRUE",
+        ]
         if access_list is not None:
             conditions.append(f"h.path like ANY ('{{ {','.join(access_list)} }}')")
 
+        # The window count runs over the already-DISTINCT subquery, so
+        # 'count' is the number of distinct representation names (it used
+        # to be the raw row count computed before DISTINCT collapsed).
         query = f"""
-            SELECT
-                DISTINCT(r.name) as name,
-                COUNT (*) OVER () as total_count
-            FROM project_{project_name}.representations as r
-            INNER JOIN project_{project_name}.versions as v
-                ON r.version_id = v.id
-            INNER JOIN project_{project_name}.products as p
-                ON v.product_id = p.id
-            INNER JOIN project_{project_name}.hierarchy as h
-                ON p.folder_id = h.id
-            {SQLTool.conditions(conditions)}
+            SELECT name, COUNT (*) OVER () as total_count
+            FROM (
+                SELECT DISTINCT(r.name) as name
+                FROM project_{project_name}.representations as r
+                INNER JOIN project_{project_name}.versions as v
+                    ON r.version_id = v.id
+                INNER JOIN project_{project_name}.products as p
+                    ON v.product_id = p.id
+                INNER JOIN project_{project_name}.hierarchy as h
+                    ON p.folder_id = h.id
+                {SQLTool.conditions(conditions)}
+            ) as distinct_names
         """
 
         total_count = 0
@@ -134,24 +144,44 @@ class SiteSync(BaseServerAddon):
             settings = await self.get_project_site_settings(
                 project_name, user.name, site_info["id"]
             )
-            local_setting = settings.dict()["local_setting"]
+            settings_dict = settings.dict()
+            local_setting = settings_dict["local_setting"]
+            config = settings_dict.get("config") or {}
+
+            # Zero-touch default, mirroring the client's
+            # `_get_zero_touch_role` exactly: synthesize local/studio only
+            # when the addon is enabled for the project, the artist set
+            # NEITHER side explicitly (all-or-nothing - a half-explicit
+            # pair resolves through the project config, same as the
+            # client), the project config pair is degenerate (an
+            # admin-forced non-degenerate pair wins) and the machine is
+            # opted in via 'sync_enabled'.
+            config_pair_degenerate = (
+                (config.get("active_site") or "studio")
+                == (config.get("remote_site") or "studio")
+            )
+            zero_touch = (
+                settings_dict.get("enabled")
+                and not local_setting["active_site"]
+                and not local_setting["remote_site"]
+                and config_pair_degenerate
+                and user.name in site_users
+                and local_setting.get("sync_enabled")
+            )
             for site_type in ["active_site", "remote_site"]:
                 used_site = local_setting[site_type]
-                if (
-                    not used_site
-                    and user.name in site_users
-                    and local_setting.get("sync_enabled")
-                ):
-                    # Zero-touch default, mirroring the client: an
-                    # opted-in ('sync_enabled') machine of this user with
-                    # no explicit pair acts as active 'local' syncing
-                    # against 'studio'. Without this the web page rendered
-                    # blank until the artist manually filled their site
-                    # settings.
+                if not used_site and zero_touch:
                     if site_type == "active_site":
                         used_site = "local"
                     else:
                         used_site = "studio"
+                if not used_site and (
+                    local_setting["active_site"]
+                    or local_setting["remote_site"]
+                ):
+                    # Half-explicit pair: the unset side resolves through
+                    # the project config, mirroring the client.
+                    used_site = config.get(site_type)
                 if not used_site:
                     continue
 
@@ -250,21 +280,33 @@ class SiteSync(BaseServerAddon):
         versions and representations to show in Loader UI.
         """
         await check_sync_status_table(project_name)
-        conditions = []
+        validate_site_name(localSite)
+        validate_site_name(remoteSite)
+
+        # Hide archived entities - a soft-deleted version must stop
+        # syncing, not keep transferring until its hard delete cascades.
+        conditions = [
+            "f.active IS TRUE",
+            "p.active IS TRUE",
+            "v.active IS TRUE",
+            "r.active IS TRUE",
+        ]
 
         if representationIds is not None:
             conditions.append(f"r.id IN {SQLTool.array(representationIds)}")
 
         if folderFilter:
-            conditions.append(f"f.name ILIKE '%{folderFilter}%'")
+            conditions.append(f"f.name ILIKE '%{escape_ilike(folderFilter)}%'")
 
         if folderIdsFilter:
             conditions.append(f"f.id IN {SQLTool.array(folderIdsFilter)}")
 
         if productFilter:
-            conditions.append(f"p.name ILIKE '%{productFilter}%'")
+            conditions.append(
+                f"p.name ILIKE '%{escape_ilike(productFilter)}%'"
+            )
 
-        if versionFilter:
+        if versionFilter is not None:
             conditions.append(f"v.version = {versionFilter}")
 
         if versionIdsFilter:
@@ -338,17 +380,23 @@ class SiteSync(BaseServerAddon):
         async for row in Postgres.iterate(query):
             files = row["representation_files"]
             file_count = len(files)
-            total_size = sum([f.get("size") for f in files])
+            # 'or 0': a representation file without a size (or a manually
+            # created status row) must not 500 the whole state page.
+            total_size = sum(f.get("size") or 0 for f in files)
 
             ldata = row["local_data"] or {}
-            lfiles = ldata.get("files", {})
-            lsize = sum([f.get("size") for f in lfiles.values()] or [0])
-            ltime = max([f.get("timestamp") for f in lfiles.values()] or [0])
+            lfiles = ldata.get("files") or {}
+            lsize = sum(f.get("size") or 0 for f in lfiles.values())
+            ltime = max(
+                [f.get("timestamp") or 0 for f in lfiles.values()] or [0]
+            )
 
             rdata = row["remote_data"] or {}
-            rfiles = rdata.get("files", {})
-            rsize = sum([f.get("size") for f in rfiles.values()] or [0])
-            rtime = max([f.get("timestamp") for f in rfiles.values()] or [0])
+            rfiles = rdata.get("files") or {}
+            rsize = sum(f.get("size") or 0 for f in rfiles.values())
+            rtime = max(
+                [f.get("timestamp") or 0 for f in rfiles.values()] or [0]
+            )
 
             local_status = SyncStatusModel(
                 status=StatusEnum.NOT_AVAILABLE
@@ -377,26 +425,28 @@ class SiteSync(BaseServerAddon):
                     FileModel(
                         id=file_id,
                         fileHash=file_info["hash"],
-                        size=file_info["size"],
+                        size=file_info.get("size") or 0,
                         path=file_info["path"],
                         baseName=os.path.split(file_info["path"])[1],
                         localStatus=SyncStatusModel(
                             status=local_file.get("status",
                                                 StatusEnum.NOT_AVAILABLE),
                             size=local_file.get("size", 0),
-                            totalSize=file_info["size"],
+                            totalSize=file_info.get("size") or 0,
                             timestamp=local_file.get("timestamp", 0),
                             message=local_file.get("message", None),
                             retries=local_file.get("retries", 0),
+                            progress=local_file.get("progress", None),
                         ),
                         remoteStatus=SyncStatusModel(
                             status=remote_file.get("status",
                                                 StatusEnum.NOT_AVAILABLE),
                             size=remote_file.get("size", 0),
-                            totalSize=file_info["size"],
+                            totalSize=file_info.get("size") or 0,
                             timestamp=remote_file.get("timestamp", 0),
                             message=remote_file.get("message", None),
                             retries=remote_file.get("retries", 0),
+                            progress=remote_file.get("progress", None),
                         ),
                     )
                 )
@@ -459,11 +509,23 @@ class SiteSync(BaseServerAddon):
                         representation_id,
                     )
                 else:
+                    # Match any row holding a FAILED file, not only rows
+                    # whose roll-up is FAILED - the roll-up ranks
+                    # IN_PROGRESS above FAILED, so a representation with
+                    # one failed file and one still transferring would
+                    # otherwise be skipped by "retry all failed".
                     rows = await conn.fetch(
                         f"""
                         SELECT representation_id, data
                         FROM project_{project_name}.sitesync_files_status
-                        WHERE site_name = $1 AND status = $2
+                        WHERE site_name = $1 AND (
+                            status = $2
+                            OR EXISTS (
+                                SELECT 1
+                                FROM jsonb_each(data->'files') AS fs
+                                WHERE (fs.value->>'status')::int = $2
+                            )
+                        )
                         FOR UPDATE
                         """,
                         site_name,
@@ -503,6 +565,7 @@ class SiteSync(BaseServerAddon):
         self,
         post_data: RepresentationStateModel,
         project_name: ProjectName,
+        user: CurrentUser,
         representation_id: RepresentationID,
         site_name: str = Path(
             ...
@@ -559,7 +622,7 @@ class SiteSync(BaseServerAddon):
                             "timestamp": 0,
                         }
                 else:
-                    files = result[0]["data"].get("files")
+                    files = result[0]["data"].get("files") or {}
 
                 for posted_file in post_data.files:
                     posted_file_id = posted_file.id
@@ -569,6 +632,20 @@ class SiteSync(BaseServerAddon):
                     files[posted_file_id]["timestamp"] = posted_file.timestamp
                     files[posted_file_id]["status"] = posted_file.status
                     files[posted_file_id]["size"] = posted_file.size
+
+                    # Live 0-1 fraction reported by providers during a
+                    # transfer. Only meaningful while IN_PROGRESS - drop
+                    # it on any other status so a finished/failed file
+                    # doesn't carry a stale fraction.
+                    if (
+                        posted_file.progress is not None
+                        and posted_file.status == StatusEnum.IN_PROGRESS
+                    ):
+                        files[posted_file_id]["progress"] = (
+                            posted_file.progress
+                        )
+                    elif "progress" in files[posted_file_id]:
+                        del files[posted_file_id]["progress"]
 
                     if posted_file.message:
                         files[posted_file_id]["message"] = posted_file.message
@@ -640,6 +717,7 @@ class SiteSync(BaseServerAddon):
     async def get_representations_site_sync_state(
         self,
         project_name: ProjectName,
+        user: CurrentUser,
         representationIds: list[str] = Query(
             None,
             description="Filter by representation ids",
@@ -653,6 +731,8 @@ class SiteSync(BaseServerAddon):
     ) -> list[RepresentationSiteStateModel]:
         """List all sites on all representations and their state"""
         await check_sync_status_table(project_name)
+        if not representationIds:
+            raise BadRequestException("'representationIds' is required")
 
         conditions = [
             f"representation_id IN {SQLTool.array(representationIds)}"
@@ -679,6 +759,30 @@ class SiteSync(BaseServerAddon):
         return repres
 
 
+# Site names and free-text filters are interpolated into SQL below (the
+# joins and ILIKE conditions cannot use bind parameters the way the query
+# is assembled), so they MUST be validated/escaped here. The tray's
+# "All files" search box feeds arbitrary artist text into the filters.
+_SITE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9 _.\-]+$")
+
+
+def validate_site_name(site_name: str) -> str:
+    """Allow only a safe charset for values interpolated into SQL."""
+    if not site_name or not _SITE_NAME_PATTERN.match(site_name):
+        raise BadRequestException(f"Invalid site name: {site_name!r}")
+    return site_name
+
+
+def escape_ilike(value: str) -> str:
+    """Escape a user string for embedding inside an ILIKE '%...%' literal.
+
+    Quotes are doubled (SQL literal), backslash/percent/underscore are
+    escaped so they match literally instead of acting as wildcards.
+    """
+    value = value.replace("\\", "\\\\").replace("'", "''")
+    return value.replace("%", "\\%").replace("_", "\\_")
+
+
 def get_overal_status(files: dict) -> StatusEnum:
     all_states = [v.get("status", StatusEnum.NOT_AVAILABLE) for v in files.values()]
     if all(stat == StatusEnum.NOT_AVAILABLE for stat in all_states):
@@ -699,8 +803,16 @@ def get_overal_status(files: dict) -> StatusEnum:
     return StatusEnum.NOT_AVAILABLE
 
 
+# Projects whose status table was already ensured in this server process -
+# without this every state poll (the tray polls every few seconds) would
+# run three DDL statements per request.
+_ensured_status_tables: set[str] = set()
+
+
 async def check_sync_status_table(project_name: str) -> None:
     """Checks for existence of `sitesync_files_status` table, creates if not."""
+    if project_name in _ensured_status_tables:
+        return
     await Postgres.execute(
         f"CREATE TABLE IF NOT EXISTS project_{project_name}.sitesync_files_status ("
         f"""representation_id UUID NOT NULL REFERENCES project_{project_name}.representations(id) ON DELETE CASCADE,
@@ -713,3 +825,4 @@ async def check_sync_status_table(project_name: str) -> None:
     )
     await Postgres.execute(f"CREATE INDEX IF NOT EXISTS file_status_idx ON project_{project_name}.sitesync_files_status(status);")
     await Postgres.execute(f"CREATE INDEX IF NOT EXISTS file_priority_idx ON project_{project_name}.sitesync_files_status(priority desc);")
+    _ensured_status_tables.add(project_name)

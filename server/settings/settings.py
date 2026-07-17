@@ -38,6 +38,18 @@ class GeneralSubmodel(BaseSettingsModel):
         title="Auto-download check interval (s)",
         description="How often to look for new assigned work to download."
     )
+    auto_download_link_depth: int = Field(
+        2,
+        ge=1,
+        le=5,
+        title="Auto-download link depth",
+        description="How many levels of 'reference' links to follow from"
+                    " an auto-downloaded workfile. 1 downloads only what"
+                    " the workfile loaded directly; 2 (default) also"
+                    " downloads what those inputs reference (e.g. a"
+                    " loaded asset's own linked dependencies). Each extra"
+                    " level costs additional link queries per task."
+    )
     min_free_space_gb: int = Field(
         5,
         title="Auto-download minimum free space (GB)",
