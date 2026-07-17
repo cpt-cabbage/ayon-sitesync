@@ -43,18 +43,10 @@ class RootSubmodel(BaseSettingsModel):
     )
 
     path: str = Field(
-        "c:/projects_local",
+        "",
         title="Path",
         scope=["site"],
     )
-
-
-default_roots = [
-    RootSubmodel(
-        name="work",
-        path="C:/projects_local",
-    )
-]
 
 
 def provider_resolver():
@@ -162,11 +154,17 @@ class LocalSubmodel(BaseSettingsModel):
                              scope=["site"],
                              enum_resolver=defined_sited_enum_resolver)
 
+    # Empty by default (used to be a 'C:/projects_local' placeholder,
+    # wrong on every non-Windows machine): with no explicit override the
+    # client synthesizes a platform-aware '~/AYON_local/<root>' default
+    # for remote machines. Explicit artist values are stored as overrides
+    # and are never affected by this default.
     local_roots: list[RootSubmodel] = Field(
-        default=default_roots,
+        default_factory=list,
         title="Local roots overrides",
         scope=["site"],
-        description="Overrides for local root(s)."
+        description="Overrides for local root(s). Leave empty to use the"
+                    " automatic '~/AYON_local' folder on remote machines."
     )
 
 

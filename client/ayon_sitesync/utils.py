@@ -1,3 +1,4 @@
+import os
 import time
 
 from ayon_core.lib import Logger
@@ -5,6 +6,57 @@ from ayon_api import get_representations, get_versions_links
 
 
 log = Logger.get_logger("SiteSync")
+
+# Path segments that identify folders mirrored by cloud-sync tools. A
+# sitesync local root inside one of these is trouble: the tool holds
+# handles on folders (intermittent rmdir/copy failures), re-uploads every
+# synced render to the cloud, and Files On-Demand placeholders can read as
+# existing files with no bytes behind them.
+_CLOUD_SYNCED_SEGMENTS = (
+    "onedrive",
+    "dropbox",
+    "google drive",
+    "googledrive",
+    "cloudstorage",
+)
+
+
+def is_cloud_synced_path(path):
+    """Heuristic check that 'path' lives inside a cloud-synced folder.
+
+    Used to veto synthesized default local roots and to warn about
+    artist-configured ones. False negatives are acceptable - this guards
+    defaults and produces warnings, it never blocks explicit choices.
+
+    Args:
+        path (str): Path to check.
+
+    Returns:
+        bool: Path looks like it is inside OneDrive/Dropbox/GDrive/etc.
+    """
+    if not path:
+        return False
+
+    normalized = path.replace("\\", "/").lower()
+    for segment in normalized.split("/"):
+        for marker in _CLOUD_SYNCED_SEGMENTS:
+            if marker in segment:
+                return True
+
+    for env_key in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+        cloud_dir = os.environ.get(env_key)
+        if not cloud_dir:
+            continue
+        try:
+            common = os.path.commonpath(
+                [os.path.abspath(path), os.path.abspath(cloud_dir)]
+            )
+            if common == os.path.abspath(cloud_dir):
+                return True
+        except ValueError:
+            # different drives on windows
+            continue
+    return False
 
 
 class ResumableError(Exception):

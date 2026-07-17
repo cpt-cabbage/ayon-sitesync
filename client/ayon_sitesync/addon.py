@@ -26,12 +26,19 @@ from ayon_api import (
 
 from .version import __version__
 from .providers.local_drive import LocalDriveHandler
+from .machine_role import (
+    ROLE_REMOTE,
+    get_saved_machine_role,
+    get_default_local_root_base,
+    probe_machine_role,
+)
 
 from .utils import (
     time_function,
     SyncStatus,
     SiteAlreadyPresentError,
     SiteSyncStatus,
+    is_cloud_synced_path,
 )
 
 SYNC_ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +119,14 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
         # projects already warned about missing settings permissions
         self._permission_warned_projects = set()
+
+        # zero-touch machine role, resolved once per process per project -
+        # a role flip mid-session would change every resolved path
+        self._machine_role_by_project = {}
+        # studio roots fetched for the reachability probe / root names
+        self._studio_roots_cache = {}
+        # local roots already warned about being cloud-synced
+        self._cloud_root_warned = set()
 
     def _warn_missing_permission(self, project_name):
         """Warn once that a project's settings are not readable.
@@ -756,10 +771,26 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         if not sync_project_settings["enabled"]:
             return "studio"
 
-        return (
-            sync_project_settings["local_setting"].get("active_site")
+        local_setting = sync_project_settings["local_setting"]
+        active_site = (
+            local_setting.get("active_site")
             or sync_project_settings["config"]["active_site"]
         )
+        remote_site = (
+            local_setting.get("remote_site")
+            or sync_project_settings["config"]["remote_site"]
+        )
+        if active_site == remote_site:
+            # Degenerate pair (the studio->studio default): with explicit
+            # settings this configuration syncs nothing, ever. Zero-touch:
+            # a machine whose role is "remote" (tray prompt answer, or
+            # unreachable studio roots) works locally against studio.
+            role = self._get_zero_touch_role(
+                project_name, sync_project_settings
+            )
+            if role == ROLE_REMOTE:
+                return self.LOCAL_SITE
+        return active_site
 
     def get_active_site(self, project_name):
         """Returns active (mine) site for project from settings.
@@ -783,14 +814,146 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
     def get_remote_site(self, project_name):
         """Remote (theirs) site for project from settings."""
         sync_project_settings = self.get_sync_project_setting(project_name)
+        local_setting = sync_project_settings["local_setting"]
         remote_site = (
-            sync_project_settings["local_setting"].get("remote_site")
+            local_setting.get("remote_site")
             or sync_project_settings["config"]["remote_site"]
         )
+        active_site = (
+            local_setting.get("active_site")
+            or sync_project_settings["config"]["active_site"]
+        )
+        if active_site == remote_site:
+            # Keep in sync with 'get_active_site_type': when zero-touch
+            # resolves the machine as remote, it works local->studio.
+            role = self._get_zero_touch_role(
+                project_name, sync_project_settings
+            )
+            if role == ROLE_REMOTE:
+                remote_site = self.DEFAULT_SITE
         if remote_site == self.LOCAL_SITE:
             return get_local_site_id()
 
         return remote_site
+
+    def _get_zero_touch_role(self, project_name, sync_project_settings):
+        """Machine role for machines with no explicit site configuration.
+
+        Returns None whenever explicit configuration exists - the artist's
+        own 'local_setting' or a non-degenerate project 'config' pair -
+        so synthesis can never override a working setup; it only replaces
+        the guaranteed-noop default. Never raises: it runs on the publish
+        path (via 'get_active_site').
+
+        Returns:
+            Union[str, None]: 'studio', 'remote' or None (no synthesis).
+        """
+        try:
+            local_setting = (
+                sync_project_settings.get("local_setting") or {}
+            )
+            if (
+                local_setting.get("active_site")
+                or local_setting.get("remote_site")
+            ):
+                return None
+            config = sync_project_settings["config"]
+            if config["active_site"] != config["remote_site"]:
+                return None
+
+            if project_name in self._machine_role_by_project:
+                return self._machine_role_by_project[project_name]
+
+            role = get_saved_machine_role()
+            if role is None:
+                role = probe_machine_role(
+                    self._get_studio_roots(project_name)
+                )
+            self._machine_role_by_project[project_name] = role
+            if role == ROLE_REMOTE:
+                self.log.info(
+                    "Zero-touch site config: machine acts as remote"
+                    " artist for '{}' (active site 'local', remote"
+                    " 'studio')".format(project_name)
+                )
+            return role
+        except Exception:
+            self.log.warning(
+                "Couldn't resolve zero-touch machine role", exc_info=True
+            )
+            return None
+
+    def _get_studio_roots(self, project_name):
+        """Studio root name -> path for current platform, cached."""
+        roots = self._studio_roots_cache.get(project_name)
+        if roots is None:
+            roots = ayon_api.get(
+                "projects/{}/siteRoots".format(project_name),
+                platform=platform.system().lower()
+            ).data
+            self._studio_roots_cache[project_name] = roots
+        return roots
+
+    def get_local_roots_with_defaults(
+        self, project_name, sitesync_settings=None
+    ):
+        """Artist's local root overrides, synthesized when unset.
+
+        Single source for every consumer of local roots (Anatomy via
+        'get_site_root_overrides', dirmap, the sync loop via
+        '_get_default_site_configs') so they can never disagree.
+
+        Args:
+            project_name (str): Project name.
+            sitesync_settings (Optional[dict]): Resolved project settings,
+                fetched when not provided.
+
+        Returns:
+            dict[str, str]: Root name -> local path.
+        """
+        if sitesync_settings is None:
+            sitesync_settings = self.get_sync_project_setting(project_name)
+
+        roots = {}
+        local_setting = sitesync_settings.get("local_setting") or {}
+        for root_info in local_setting.get("local_roots") or []:
+            roots[root_info["name"]] = root_info["path"]
+
+        if roots:
+            for root_name, root_path in roots.items():
+                self._warn_cloud_synced_root(root_name, root_path)
+            return roots
+
+        role = self._get_zero_touch_role(project_name, sitesync_settings)
+        if role != ROLE_REMOTE:
+            return roots
+
+        try:
+            base = get_default_local_root_base()
+            for root_name in self._get_studio_roots(project_name):
+                roots[root_name] = os.path.join(base, root_name)
+        except Exception:
+            self.log.warning(
+                "Couldn't synthesize default local roots for '{}'".format(
+                    project_name),
+                exc_info=True
+            )
+        return roots
+
+    def _warn_cloud_synced_root(self, root_name, root_path):
+        if not is_cloud_synced_path(root_path):
+            return
+        key = (root_name, root_path)
+        if key in self._cloud_root_warned:
+            return
+        self._cloud_root_warned.add(key)
+        self.log.warning(
+            "Local root '{}' ({}) appears to be inside a cloud-synced"
+            " folder (OneDrive/Dropbox/...). Cloud tools hold handles on"
+            " folders (intermittent failures) and re-upload every synced"
+            " file - use a plain local folder instead.".format(
+                root_name, root_path)
+        )
 
     def get_site_root_overrides(
         self, project_name, site_name, local_settings=None
@@ -827,10 +990,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         roots = {}
         if not sitesync_settings["enabled"]:
             return roots
-        local_project_settings = sitesync_settings["local_setting"]
         if site_name == "local":
-            for root_info in local_project_settings["local_roots"]:
-                roots[root_info["name"]] = root_info["path"]
+            roots = self.get_local_roots_with_defaults(
+                project_name, sitesync_settings
+            )
 
         return roots
 
@@ -1151,6 +1314,31 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         (eg. has valid credentials).
         """
         self.server_start()
+        self._schedule_machine_role_prompt()
+
+    def _schedule_machine_role_prompt(self):
+        """Schedule the one-time 'studio or remote?' prompt.
+
+        Tray-only (needs Qt). Delayed so the tray finishes starting
+        first; never raises - the probe fallback covers an unanswered
+        prompt.
+        """
+        if not self.enabled:
+            return
+        try:
+            if get_saved_machine_role() is not None:
+                return
+
+            from qtpy import QtCore
+            from .tray_prompt import show_machine_role_prompt
+
+            QtCore.QTimer.singleShot(
+                3000, lambda: show_machine_role_prompt(self)
+            )
+        except Exception:
+            self.log.warning(
+                "Couldn't schedule machine role prompt", exc_info=True
+            )
 
     def server_start(self):
         if self.enabled:
@@ -1396,7 +1584,12 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         }
         all_sites = {self.DEFAULT_SITE: studio_config}
         if sync_enabled:
-            roots = project_settings["local_setting"]["local_roots"]
+            # dict {root_name: path}, incl. zero-touch synthesized
+            # defaults - must match what 'get_site_root_overrides' hands
+            # to Anatomy, or the loop and path resolution would disagree
+            roots = self.get_local_roots_with_defaults(
+                project_name, project_settings
+            )
             local_site_dict = {
                 "enabled": True,
                 "provider": "local_drive",

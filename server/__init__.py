@@ -123,11 +123,24 @@ class SiteSync(BaseServerAddon):
         sites = {"active_site": [], "remote_site": []}
         site_infos = await Postgres.fetch("select id, data from sites")
         for site_info in site_infos:
+            site_data = site_info["data"] or {}
+            site_users = site_data.get("users") or []
             settings = await self.get_project_site_settings(
                 project_name, user.name, site_info["id"]
             )
+            local_setting = settings.dict()["local_setting"]
             for site_type in ["active_site", "remote_site"]:
-                used_site = settings.dict()["local_setting"][site_type]
+                used_site = local_setting[site_type]
+                if not used_site and user.name in site_users:
+                    # Zero-touch default, mirroring the client: an
+                    # unconfigured machine of this user acts as active
+                    # 'local' syncing against 'studio'. Without this the
+                    # web page rendered blank until the artist manually
+                    # filled their site settings.
+                    if site_type == "active_site":
+                        used_site = "local"
+                    else:
+                        used_site = "studio"
                 if not used_site:
                     continue
 
@@ -135,6 +148,9 @@ class SiteSync(BaseServerAddon):
                     sites[site_type].append(site_info["id"])
                 else:
                     sites[site_type].append(used_site)
+        # multiple sites can resolve to the same value (e.g. 'studio')
+        for site_type, values in sites.items():
+            sites[site_type] = list(dict.fromkeys(values))
         return sites
 
 
