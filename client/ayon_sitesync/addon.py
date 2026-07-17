@@ -29,10 +29,8 @@ from .version import __version__
 from .providers.local_drive import LocalDriveHandler
 from .machine_role import (
     ROLE_REMOTE,
-    get_saved_machine_role,
     get_default_local_root_base,
     get_machine_pref,
-    probe_machine_role,
     set_machine_pref,
 )
 
@@ -126,12 +124,11 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         # throttle for tray failure notifications, per project
         self._last_notification_by_project = {}
         self._pause_action = None
-        self._queue_window = None
+        self._control_window = None
 
-        # zero-touch machine role, resolved once per process per project -
-        # a role flip mid-session would change every resolved path
-        self._machine_role_by_project = {}
-        # studio roots fetched for the reachability probe / root names
+        # projects the zero-touch opt-in was already logged for
+        self._zero_touch_logged = set()
+        # studio roots fetched for synthesized root names
         self._studio_roots_cache = {}
         # local roots already warned about being cloud-synced
         self._cloud_root_warned = set()
@@ -535,16 +532,26 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
     # TODO hook to some trigger - no Sync Queue anymore
     def validate_project(self, project_name, site_name, reset_missing=False):
-        """Validate 'project_name' of 'site_name' and its local files
+        """Adopt files already on disk for 'site_name' of 'project_name'.
 
-        If file present and not marked with a 'site_name' in DB, DB is
-        updated with site name and file modified date.
+        Per-file honest: for every representation, files that exist
+        locally are marked OK, files that don't keep their current status
+        (or become QUEUED so the loop can fetch them once the repre has
+        any local presence). The whole per-file payload is posted in one
+        call per representation, so a repre with only some files on disk
+        is recorded as partially synced - the old implementation marked
+        ALL files OK as soon as one existed, permanently hiding the rest
+        from the sync loop.
+
+        State is fetched through '_get_repres_state', which chunks and
+        pages - the old single call silently truncated at the server's
+        50-row default page, force-resetting anything past it.
 
         Args:
             project_name (str): project name
             site_name (str): active site name
-            reset_missing (bool): if True reset site in DB if missing
-                physically to be resynched
+            reset_missing (bool): if True reset files marked OK in DB but
+                missing physically to be re-synced
         """
         self.log.debug("Validation of {} for {} started".format(
             project_name, site_name
@@ -554,111 +561,145 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             self.log.debug("No repre found")
             return
 
-        sites_added = 0
-        sites_reset = 0
-        repre_ids = [repre["id"] for repre in repre_entities]
-        repre_states = self.get_representations_sync_state(
-            project_name, repre_ids, site_name, site_name)
+        repre_by_id = {
+            repre["id"]: repre
+            for repre in repre_entities
+            if repre.get("files")
+        }
+        repre_states = self._get_repres_state(
+            project_name, list(repre_by_id.keys()), site_name, site_name
+        )
+        state_by_repre_id = {
+            state["representationId"]: state for state in repre_states
+        }
 
-        for repre_entity in repre_entities:
-            repre_id = repre_entity["id"]
-            is_on_site = False
-            repre_state = repre_states.get(repre_id)
-            if repre_state:
-                is_on_site = repre_state[0] == SiteSyncStatus.OK
-            for repre_file in repre_entity.get("files", []):
+        repres_updated = 0
+        files_adopted = 0
+        files_reset = 0
+        for repre_id, repre_entity in repre_by_id.items():
+            state = state_by_repre_id.get(repre_id)
+            status_by_file_id = {}
+            if state:
+                for file_state in state.get("files") or []:
+                    status_by_file_id[file_state["id"]] = (
+                        file_state["localStatus"]["status"]
+                    )
+
+            payload_files = []
+            changed = False
+            any_local_presence = False
+            for repre_file in repre_entity["files"]:
                 file_path = repre_file.get("path", "")
                 local_file_path = self.get_local_file_path(
                     project_name, site_name, file_path
                 )
-
                 file_exists = (
                     local_file_path and os.path.exists(local_file_path)
                 )
-                if not is_on_site:
-                    if file_exists:
-                        self.log.debug(
-                            f"Adding presence on site '{site_name}' for "
-                            f"'{repre_id}'"
-                        )
-                        self.add_site(
-                            project_name,
-                            repre_id,
-                            site_name=site_name,
-                            file_id=repre_file["id"],
-                            force=True,
-                            status=SiteSyncStatus.OK
-                        )
-                        sites_added += 1
-                else:
-                    if not file_exists and reset_missing:
-                        self.log.debug(
-                            "Resetting site {} for {}".format(
-                                site_name, repre_id
-                            ))
-                        self.reset_site_on_representation(
-                            project_name,
-                            repre_id,
-                            site_name=site_name,
-                            file_id=repre_file["id"]
-                        )
-                        sites_reset += 1
+                current_status = status_by_file_id.get(
+                    repre_file["id"], SiteSyncStatus.NA
+                )
 
-        if sites_added % 100 == 0:
-            self.log.debug("Sites added {}".format(sites_added))
+                new_status = current_status
+                if file_exists:
+                    any_local_presence = True
+                    if current_status != SiteSyncStatus.OK:
+                        new_status = SiteSyncStatus.OK
+                        files_adopted += 1
+                        changed = True
+                elif current_status == SiteSyncStatus.OK and reset_missing:
+                    new_status = SiteSyncStatus.QUEUED
+                    files_reset += 1
+                    changed = True
+                elif current_status == SiteSyncStatus.NA and state:
+                    # The repre already has a record on this site - queue
+                    # missing files so the loop can complete it instead of
+                    # leaving an OK/NA mix whose roll-up reads NA.
+                    new_status = SiteSyncStatus.QUEUED
+                    changed = True
 
-        self.log.debug("Validation of {} for {} ended".format(
-            project_name, site_name
-        ))
-        self.log.info("Sites added {}, sites reset {}".format(
-            sites_added, reset_missing
-        ))
+                payload_files.append({
+                    "id": repre_file["id"],
+                    "fileHash": repre_file["hash"],
+                    "size": repre_file.get("size") or 0,
+                    "timestamp": datetime.now().timestamp(),
+                    "status": new_status,
+                })
 
-    # TODO hook to some trigger - no Sync Queue anymore
+            if not changed or not any_local_presence:
+                # Nothing on disk and nothing recorded - don't mint a
+                # site record for a repre this machine has no part of.
+                continue
+
+            # Missing files of a newly created record become QUEUED, not
+            # NA, for the same roll-up reason as above.
+            for payload_file in payload_files:
+                if payload_file["status"] == SiteSyncStatus.NA:
+                    payload_file["status"] = SiteSyncStatus.QUEUED
+
+            # force=True rebuilds the stored file dict from the current
+            # representation payload, healing rows with stale file ids
+            # (e.g. after a version overwrite); the complete per-file
+            # payload posted here then restores every status explicitly.
+            self._set_state_sync_state(
+                project_name,
+                repre_id.replace("-", ""),
+                site_name,
+                {"files": payload_files},
+                force=True,
+            )
+            repres_updated += 1
+
+        if repres_updated:
+            # One wake for the whole batch (add_site used to fire one
+            # per adopted representation).
+            self.reset_timer()
+
+        self.log.info(
+            "Validation of {} for {} ended: {} representation(s) updated,"
+            " {} file(s) adopted, {} file(s) reset".format(
+                project_name, site_name, repres_updated,
+                files_adopted, files_reset
+            )
+        )
+
+    # wired to the tray control window's per-row "Pause syncing"
     def pause_representation(
         self, project_name, representation_id, site_name
     ):
-        """Pause sync of representation entity on site.
+        """Pause sync of representation for this tray session.
 
-        Sets 'representation_id' as paused, eg. no syncing should be
-            happening on it.
+        In-memory only: the sync loop checks 'is_representation_paused'
+        before processing each representation. The upstream version also
+        wrote to the DB via 'update_db', but that call crashed - it was
+        made without the mandatory 'side'/'file' arguments - so the DB
+        write is intentionally gone. The pause does not survive a tray
+        restart.
 
         Args:
-            project_name (str): Project name.
+            project_name (str): Project name (kept for signature parity).
             representation_id (str): Representation id.
-            site_name (str): Site name 'gdrive', 'studio' etc.
+            site_name (str): Site name (kept for signature parity).
 
         """
         self.log.info("Pausing SiteSync for {}".format(representation_id))
         self._paused_representations.add(representation_id)
-        repre_entity = get_representation_by_id(
-            project_name, representation_id
-        )
-        self.update_db(project_name, repre_entity, site_name, pause=True)
 
-    # TODO hook to some trigger - no Sync Queue anymore
     def unpause_representation(
         self, project_name, representation_id, site_name
     ):
-        """Unpause sync of representation entity on site.
+        """Unpause sync of representation.
 
-        Does not fail or warn if repre wasn't paused.
+        Does not fail or warn if repre wasn't paused. See
+        'pause_representation' for why this is in-memory only.
 
         Args:
-            project_name (str): Project name.
+            project_name (str): Project name (kept for signature parity).
             representation_id (str): Representation id.
-            site_name (str): Site name 'gdrive', 'studio' etc.
+            site_name (str): Site name (kept for signature parity).
         """
         self.log.info("Unpausing SiteSync for {}".format(representation_id))
-        try:
-            self._paused_representations.remove(representation_id)
-        except KeyError:
-            pass
-        # self.paused_representations is not persistent
-        repre_entity = get_representation_by_id(
-            project_name, representation_id
-        )
-        self.update_db(project_name, repre_entity, site_name, pause=False)
+        self._paused_representations.discard(representation_id)
 
     def is_representation_paused(
         self, representation_id, check_parents=False, project_name=None
@@ -791,8 +832,8 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         if active_site == remote_site:
             # Degenerate pair (the studio->studio default): with explicit
             # settings this configuration syncs nothing, ever. Zero-touch:
-            # a machine whose role is "remote" (tray prompt answer, or
-            # unreachable studio roots) works locally against studio.
+            # a site opted in via 'sync_enabled' works locally against
+            # studio.
             role = self._get_zero_touch_role(
                 project_name, sync_project_settings
             )
@@ -847,14 +888,18 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
     def _get_zero_touch_role(self, project_name, sync_project_settings):
         """Machine role for machines with no explicit site configuration.
 
-        Returns None whenever explicit configuration exists - the artist's
-        own 'local_setting' or a non-degenerate project 'config' pair -
-        so synthesis can never override a working setup; it only replaces
-        the guaranteed-noop default. Never raises: it runs on the publish
-        path (via 'get_active_site').
+        Site sync is opt-in per artist site: the site-scoped
+        'local_setting.sync_enabled' toggle (off by default) is what
+        makes an unconfigured machine act as a remote artist (active
+        'local', remote 'studio'). Returns None whenever explicit
+        configuration exists - the artist's own active/remote pair or a
+        non-degenerate project 'config' pair - so synthesis can never
+        override a working setup; it only replaces the guaranteed-noop
+        default. Never raises: it runs on the publish path (via
+        'get_active_site').
 
         Returns:
-            Union[str, None]: 'studio', 'remote' or None (no synthesis).
+            Union[str, None]: 'remote' or None (no synthesis).
         """
         try:
             local_setting = (
@@ -868,23 +913,17 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             config = sync_project_settings["config"]
             if config["active_site"] != config["remote_site"]:
                 return None
+            if not local_setting.get("sync_enabled"):
+                return None
 
-            if project_name in self._machine_role_by_project:
-                return self._machine_role_by_project[project_name]
-
-            role = get_saved_machine_role()
-            if role is None:
-                role = probe_machine_role(
-                    self._get_studio_roots(project_name)
-                )
-            self._machine_role_by_project[project_name] = role
-            if role == ROLE_REMOTE:
+            if project_name not in self._zero_touch_logged:
+                self._zero_touch_logged.add(project_name)
                 self.log.info(
-                    "Zero-touch site config: machine acts as remote"
-                    " artist for '{}' (active site 'local', remote"
-                    " 'studio')".format(project_name)
+                    "Site sync opted in for this site: machine acts as"
+                    " remote artist for '{}' (active site 'local',"
+                    " remote 'studio')".format(project_name)
                 )
-            return role
+            return ROLE_REMOTE
         except Exception:
             self.log.warning(
                 "Couldn't resolve zero-touch machine role", exc_info=True
@@ -1163,11 +1202,18 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             file_id (str): File id of file handled.
 
         """
-        sites = self._transform_sites_from_settings(self.sync_studio_settings)
-        sites[self.DEFAULT_SITE] = {
+        # Use the project-RESOLVED settings, matching the publish-time
+        # `_add_alternative_sites`. This used to read the unresolved
+        # studio-level settings, so a project override adding or changing
+        # 'alternative_sites' worked at publish time but was ignored by
+        # this post-transfer propagation (same unresolved-vs-resolved
+        # mistake as the studio 'enabled' veto fixed in +ls.0.0.2).
+        project_settings = self.get_sync_project_setting(project_name) or {}
+        sites = copy.deepcopy(project_settings.get("sites") or {})
+        sites.setdefault(self.DEFAULT_SITE, {
             "provider": "local_drive",
             "alternative_sites": []
-        }
+        })
 
         alternate_sites = []
         for site_name, site_info in sites.items():
@@ -1224,21 +1270,41 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
         """
         version_ids = set(version_ids)
-        endpoint = "{}/projects/{}/sitesync/state".format(
+        # This used to target a nonexistent route
+        # ('{prefix}/projects/{project}/sitesync/state') with a misspelled
+        # 'versionIdFilter' param - every call 404ed. Use the real state
+        # endpoint with chunked ids and explicit paging.
+        endpoint = "{}/{}/state".format(
             self.endpoint_prefix, project_name
         )
 
-        # get to upload
-        kwargs = {
-            "localSite": active_site,
-            "remoteSite": remote_site,
-            "versionIdFilter": list(version_ids)
-        }
-
-        # kwargs["representationId"] = "94dca33a-7705-11ed-8c0a-34e12d91d510"
-
-        response = ayon_api.get(endpoint, **kwargs)
-        repre_states = response.data.get("representations", [])
+        chunk_size = 50
+        page_length = 500
+        all_version_ids = list(version_ids)
+        repre_states = []
+        for chunk_start in range(0, len(all_version_ids), chunk_size):
+            chunk = all_version_ids[chunk_start:chunk_start + chunk_size]
+            page = 1
+            while True:
+                kwargs = {
+                    "localSite": active_site,
+                    "remoteSite": remote_site,
+                    "versionIdsFilter": chunk,
+                    "page": page,
+                    "pageLength": page_length,
+                }
+                response = ayon_api.get(endpoint, **kwargs)
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        "Cannot get sync state for versions {}".format(
+                            chunk
+                        )
+                    )
+                rows = response.data.get("representations") or []
+                repre_states.extend(rows)
+                if len(rows) < page_length:
+                    break
+                page += 1
         repre_info_by_version_id = {
             version_id: {
                 "id": version_id,
@@ -1322,37 +1388,12 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         (eg. has valid credentials).
         """
         self.server_start()
-        self._schedule_machine_role_prompt()
         if self.enabled:
             # detect the invisible per-site 'enabled: false' override
             # without blocking tray startup on network calls
             threading.Thread(
                 target=self._run_doctor_checks, daemon=True
             ).start()
-
-    def _schedule_machine_role_prompt(self):
-        """Schedule the one-time 'studio or remote?' prompt.
-
-        Tray-only (needs Qt). Delayed so the tray finishes starting
-        first; never raises - the probe fallback covers an unanswered
-        prompt.
-        """
-        if not self.enabled:
-            return
-        try:
-            if get_saved_machine_role() is not None:
-                return
-
-            from qtpy import QtCore
-            from .tray_prompt import show_machine_role_prompt
-
-            QtCore.QTimer.singleShot(
-                3000, lambda: show_machine_role_prompt(self)
-            )
-        except Exception:
-            self.log.warning(
-                "Couldn't schedule machine role prompt", exc_info=True
-            )
 
     def server_start(self):
         if self.enabled:
@@ -1416,8 +1457,9 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
     def tray_menu(self, parent_menu):
         """Site Sync submenu in the tray.
 
-        Wires the long-dormant pause/resume and 'validate_project' APIs
-        to something an artist can actually click.
+        Quick toggles only - everything else (auto-download switch,
+        adopt existing files, queue, per-file actions) lives in the
+        control panel window ('tray_control_window.py').
         """
         if not self.enabled:
             return
@@ -1437,38 +1479,11 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         menu.addAction(pause_action)
         self._pause_action = pause_action
 
-        auto_download_action = QtWidgets.QAction(
-            "Auto-download new work", menu
-        )
-        auto_download_action.setCheckable(True)
-        auto_download_action.setChecked(
-            bool(get_machine_pref("auto_download", True))
-        )
-        auto_download_action.setToolTip(
-            "Automatically download published work for your assigned and"
-            " recently opened tasks. Uncheck to stop background"
-            " downloads; your own publishes still upload."
-        )
-        auto_download_action.triggered.connect(
-            self._on_tray_auto_download_toggle
-        )
-        menu.addAction(auto_download_action)
-
         menu.addSeparator()
 
-        queue_action = QtWidgets.QAction("Show sync queue...", menu)
-        queue_action.triggered.connect(self._on_tray_show_queue)
-        menu.addAction(queue_action)
-
-        validate_action = QtWidgets.QAction(
-            "Adopt existing local files", menu
-        )
-        validate_action.setToolTip(
-            "Scan the local folder and mark files that are already"
-            " present as synced, so they are not downloaded again."
-        )
-        validate_action.triggered.connect(self._on_tray_validate)
-        menu.addAction(validate_action)
+        control_action = QtWidgets.QAction("Sync control panel...", menu)
+        control_action.triggered.connect(self._on_tray_show_control)
+        menu.addAction(control_action)
 
         web_action = QtWidgets.QAction("Open sync status page...", menu)
         web_action.triggered.connect(self._on_tray_open_web)
@@ -1480,17 +1495,19 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         self.log.info("Manual sync requested from tray")
         self.reset_timer()
 
-    def _on_tray_show_queue(self):
+    def _on_tray_show_control(self):
         try:
-            if self._queue_window is None:
-                from .tray_queue_window import SyncQueueWindow
+            if self._control_window is None:
+                from .tray_control_window import SyncControlWindow
 
-                self._queue_window = SyncQueueWindow(self)
-            self._queue_window.show()
-            self._queue_window.raise_()
-            self._queue_window.activateWindow()
+                self._control_window = SyncControlWindow(self)
+            self._control_window.show()
+            self._control_window.raise_()
+            self._control_window.activateWindow()
         except Exception:
-            self.log.warning("Couldn't open sync queue window", exc_info=True)
+            self.log.warning(
+                "Couldn't open sync control window", exc_info=True
+            )
 
     def _on_tray_pause_toggle(self, checked=False):
         if checked:
@@ -1499,6 +1516,22 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             self.unpause_server()
             # resume immediately instead of waiting out the pause poll
             self.reset_timer()
+        self._sync_pause_ui(bool(checked))
+
+    def _sync_pause_ui(self, checked):
+        """Keep the tray action and control window checkbox in step.
+
+        Both call '_on_tray_pause_toggle'; 'setChecked' does not re-emit
+        the user-interaction signals ('triggered'/'clicked'), so this
+        cannot loop.
+        """
+        try:
+            if self._pause_action is not None:
+                self._pause_action.setChecked(checked)
+            if self._control_window is not None:
+                self._control_window.set_pause_checked(checked)
+        except Exception:
+            self.log.warning("Couldn't sync pause UI state", exc_info=True)
 
     def _on_tray_auto_download_toggle(self, checked=False):
         try:
@@ -1509,6 +1542,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
             if checked:
                 self.reset_timer()
+            if self._control_window is not None:
+                self._control_window.set_auto_download_checked(
+                    bool(checked)
+                )
         except Exception:
             self.log.warning(
                 "Couldn't persist auto-download preference", exc_info=True
@@ -1922,11 +1959,15 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         )
 
         # get to upload
+        # 'pageLength' must be passed explicitly: the endpoint pages at 50
+        # rows by default, silently halving any provider batch limit
+        # above it.
         kwargs = {
             "localSite": active_site,
             "remoteSite": remote_site,
             "localStatusFilter": [SiteSyncStatus.OK],
             "remoteStatusFilter": [SiteSyncStatus.QUEUED],
+            "pageLength": max(int(limit or 0), 1),
         }
 
         response = ayon_api.get(endpoint, **kwargs)
@@ -2044,7 +2085,11 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
             status_entity["fileHash"] = file_status["fileHash"]
             status_entity["id"] = file_status["id"]
-            if file_status["fileHash"] == file["fileHash"]:
+            # Match by file id, not fileHash: two identical files at
+            # different paths share a hash, and a hash match marked BOTH
+            # OK when only one was actually transferred - the twin was
+            # never copied yet read as synced.
+            if file_status["id"] == file["id"]:
                 if new_file_id:
                     status_entity["status"] = SiteSyncStatus.OK
                     status_entity.pop("message")
@@ -2391,8 +2436,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
     ):
         """Use server endpoint to get synchronization info for representations.
 
-        Calculates float progress based on progress of all files for repre.
-        If repre is fully synchronized it returns 1, 0 for any other state.
+        Calculates float progress based on progress of all files for repre:
+        1 when fully synchronized, otherwise the fraction of files done
+        (counting fully synced files plus the live fraction of anything
+        currently transferring).
 
         Args:
             project_name (str):
@@ -2413,35 +2460,35 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             remote_site_name,
             **kwargs
         )
+        def _side_progress(repre_state, side_key):
+            """Fraction of a repre available on one side.
+
+            Counts fully synced files as 1 and adds the live per-file
+            fraction of anything IN_PROGRESS. The old implementation
+            only summed the (then never populated) 'progress' key and
+            ignored per-file OK statuses entirely, so a repre at 25 of
+            26 files read 0.
+            """
+            repre_status = repre_state[side_key]["status"]
+            if repre_status == SiteSyncStatus.OK:
+                return 1
+            file_states = repre_state.get("files") or []
+            if not file_states:
+                return 0
+            done = 0
+            for file_info in file_states:
+                file_status = file_info[side_key]
+                if file_status["status"] == SiteSyncStatus.OK:
+                    done += 1
+                else:
+                    done += file_status.get("progress") or 0
+            return done / len(file_states)
+
         states = {}
         for repre_state in repre_states:
-            repre_files_count = len(repre_state["files"])
-
-            repre_local_status = repre_state["localStatus"]["status"]
-            repre_local_progress = 0
-            if repre_local_status == SiteSyncStatus.OK:
-                repre_local_progress = 1
-            elif repre_local_status == SiteSyncStatus.IN_PROGRESS:
-                local_sum = sum(
-                    file_info["localStatus"].get("progress", 0)
-                    for file_info in repre_state["files"]
-                )
-                repre_local_progress = local_sum / repre_files_count
-
-            repre_remote_status = repre_state["remoteStatus"]["status"]
-            repre_remote_progress = 0
-            if repre_remote_status == SiteSyncStatus.OK:
-                repre_remote_progress = 1
-            elif repre_remote_status == SiteSyncStatus.IN_PROGRESS:
-                remote_sum = sum(
-                    file_info["remoteStatus"].get("progress", 0)
-                    for file_info in repre_state["files"]
-                )
-                repre_remote_progress = remote_sum / repre_files_count
-
             states[repre_state["representationId"]] = (
-                repre_local_progress,
-                repre_remote_progress
+                _side_progress(repre_state, "localStatus"),
+                _side_progress(repre_state, "remoteStatus"),
             )
 
         return states
@@ -2467,27 +2514,46 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         """
         if not remote_site_name:
             remote_site_name = local_site_name
-        payload_dict = {
-            "localSite": local_site_name,
-            "remoteSite": remote_site_name,
-            "representationIds": representation_ids
-        }
-        if kwargs:
-            payload_dict.update(kwargs)
 
         endpoint = "{}/{}/state".format(
             self.endpoint_prefix, project_name
         )
 
-        response = ayon_api.get(endpoint, **payload_dict)
-        if response.status_code != 200:
-            raise RuntimeError(
-                "Cannot get sync state for representations {}".format(
-                    representation_ids
-                )
-            )
+        # The endpoint pages at 50 rows by default - callers used to get
+        # silently truncated results (wrong Loader availability, corrupted
+        # 'adopt local files' runs). Chunk the ids so huge projects don't
+        # overflow the query string, page explicitly, and always pass
+        # 'pageLength'.
+        repre_ids = list(representation_ids)
+        chunk_size = 100
+        states = []
+        for chunk_start in range(0, len(repre_ids), chunk_size):
+            chunk = repre_ids[chunk_start:chunk_start + chunk_size]
+            page = 1
+            while True:
+                payload_dict = {
+                    "localSite": local_site_name,
+                    "remoteSite": remote_site_name,
+                    "representationIds": chunk,
+                    "page": page,
+                    "pageLength": chunk_size,
+                }
+                if kwargs:
+                    payload_dict.update(kwargs)
 
-        return response.data["representations"]
+                response = ayon_api.get(endpoint, **payload_dict)
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        "Cannot get sync state for representations "
+                        "{}".format(chunk)
+                    )
+                rows = response.data["representations"]
+                states.extend(rows)
+                if len(rows) < payload_dict["pageLength"]:
+                    break
+                page += 1
+
+        return states
 
     def get_version_availability(
         self,
@@ -2513,24 +2579,42 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
         """
         version_ids = list(version_ids)
-        payload_dict = {
-            "localSite": local_site_name,
-            "remoteSite": remote_site_name,
-            "versionIdsFilter": version_ids
-        }
-        payload_dict.update(kwargs)
 
         endpoint = "{}/{}/state".format(
             self.endpoint_prefix, project_name
         )
 
-        response = ayon_api.get(endpoint, **payload_dict)
-        if response.status_code != 200:
-            raise RuntimeError(
-                "Cannot get sync state for versions {}".format(
-                    version_ids
-                )
-            )
+        # Chunk version ids and page explicitly - the endpoint's 50-row
+        # default page silently truncated availability for anything past
+        # it (the Loader rendered those versions as unavailable).
+        chunk_size = 50
+        page_length = 500
+        repre_states = []
+        for chunk_start in range(0, len(version_ids), chunk_size):
+            chunk = version_ids[chunk_start:chunk_start + chunk_size]
+            page = 1
+            while True:
+                payload_dict = {
+                    "localSite": local_site_name,
+                    "remoteSite": remote_site_name,
+                    "versionIdsFilter": chunk,
+                    "page": page,
+                    "pageLength": page_length,
+                }
+                payload_dict.update(kwargs)
+
+                response = ayon_api.get(endpoint, **payload_dict)
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        "Cannot get sync state for versions {}".format(
+                            chunk
+                        )
+                    )
+                rows = response.data["representations"]
+                repre_states.extend(rows)
+                if len(rows) < payload_dict["pageLength"]:
+                    break
+                page += 1
 
         version_statuses = {
             version_id: (0, 0)
@@ -2538,7 +2622,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         }
 
         repre_avail_by_version_id = defaultdict(list)
-        for repre_avail in response.data["representations"]:
+        for repre_avail in repre_states:
             version_id = repre_avail["versionId"]
             repre_avail_by_version_id[version_id].append(repre_avail)
 
@@ -2591,11 +2675,29 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
             return
 
+        # Version-level resources (e.g. textures published with a look)
+        # are attached to EVERY representation of the version by the
+        # integrator, so this repre's file list can include files a
+        # sibling repre still claims on this site. Deleting those would
+        # leave the sibling marked OK locally with its files gone.
+        shared_paths = self._get_paths_held_by_siblings(
+            project_name, representation, site_name
+        )
+
         for file in representation["files"]:
+            file_path = file.get("path")
+            if file_path in shared_paths:
+                self.log.debug(
+                    "Keeping '{}' - another representation of this"
+                    " version still holds it on '{}'".format(
+                        file_path, site_name
+                    )
+                )
+                continue
             local_file_path = self.get_local_file_path(
                 project_name,
                 site_name,
-                file.get("path")
+                file_path
             )
             if local_file_path is None:
                 raise ValueError("Missing local file path")
@@ -2627,6 +2729,58 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 self.log.warning(
                     "folder {} cannot be removed".format(folder)
                 )
+
+    def _get_paths_held_by_siblings(
+        self, project_name, representation, site_name
+    ):
+        """Paths other repres of the same version still hold on a site.
+
+        Best-effort: on any error it returns an empty set (removal then
+        behaves as before this guard existed).
+
+        Returns:
+            set[str]: Rootless paths that must not be deleted.
+        """
+        try:
+            repre_id = str(representation["id"]).replace("-", "")
+            sibling_repres = [
+                repre
+                for repre in get_representations(
+                    project_name,
+                    version_ids=[representation["versionId"]]
+                )
+                if str(repre["id"]).replace("-", "") != repre_id
+            ]
+            if not sibling_repres:
+                return set()
+
+            states = self._get_repres_state(
+                project_name,
+                [repre["id"] for repre in sibling_repres],
+                site_name,
+                site_name,
+            )
+            held_repre_ids = {
+                str(state["representationId"]).replace("-", "")
+                for state in states
+                if state["localStatus"]["status"] != SiteSyncStatus.NA
+            }
+
+            paths = set()
+            for repre in sibling_repres:
+                if str(repre["id"]).replace("-", "") not in held_repre_ids:
+                    continue
+                for repre_file in repre.get("files") or []:
+                    if repre_file.get("path"):
+                        paths.add(repre_file["path"])
+            return paths
+        except Exception:
+            self.log.warning(
+                "Couldn't check sibling representations before removing"
+                " local files",
+                exc_info=True
+            )
+            return set()
 
     def reset_timer(self):
         """

@@ -14,7 +14,7 @@ import pyblish.api
 from ayon_core.addon import AYONAddon
 from ayon_api import get_representations
 
-from ayon_sitesync.utils import SiteSyncStatus
+from ayon_sitesync.utils import SiteAlreadyPresentError, SiteSyncStatus
 
 
 class IntegrateSiteSync(pyblish.api.InstancePlugin):
@@ -42,12 +42,35 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
         )
         for repre_id, inst in published_representations.items():
             for site_info in published_sites:
-                sitesync_addon.add_site(
-                    project_name,
-                    repre_id,
-                    site_info["name"],
-                    status=site_info["status"]
-                )
+                try:
+                    sitesync_addon.add_site(
+                        project_name,
+                        repre_id,
+                        site_info["name"],
+                        status=site_info["status"]
+                    )
+                except SiteAlreadyPresentError:
+                    # Publishing into an EXISTING version keeps repre ids
+                    # but regenerates file ids, so a site record already
+                    # exists. Without the force retry the publish failed
+                    # here - and the stale record would keep pointing at
+                    # the previous publish's file ids, wedging the repre
+                    # (the server skips unknown file ids on update).
+                    # force=True rebuilds the record from the current
+                    # representation payload with this publish's status.
+                    self.log.info(
+                        "Site '{}' already recorded for '{}' - version"
+                        " overwrite, resetting the record".format(
+                            site_info["name"], repre_id
+                        )
+                    )
+                    sitesync_addon.add_site(
+                        project_name,
+                        repre_id,
+                        site_info["name"],
+                        status=site_info["status"],
+                        force=True,
+                    )
 
         hero_version_entity = instance.data.get("heroVersionEntity")
         self.log.info(f"hero_version_entity::{hero_version_entity}")
