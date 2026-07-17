@@ -1,6 +1,6 @@
 import axios from 'axios'
 import { useState, useEffect } from 'react'
-import { Section, TablePanel } from '@ynput/ayon-react-components'
+import { Button, Section, TablePanel } from '@ynput/ayon-react-components'
 
 import { DataTable } from 'primereact/datatable'
 import { Column } from 'primereact/column'
@@ -95,7 +95,6 @@ const SiteSyncSummary = ({
 
   useEffect(() => {
     setLoading(true)
-    console.log(lazyParams)
     axios
       .get(baseUrl + buildQueryString(selectedLocalSite,
                                       selectedRemoteSite,
@@ -122,6 +121,23 @@ const SiteSyncSummary = ({
     new_event['page'] = 0
     setLazyParams(new_event)
 }
+
+  const retryAllFailed = () => {
+    // requeue every FAILED file on both selected sites; desktop clients
+    // pick them up on their next loop
+    setLoading(true)
+    const sites = [
+      ...new Set([selectedLocalSite, selectedRemoteSite].filter(Boolean)),
+    ]
+    Promise.allSettled(
+      sites.map((site) =>
+        axios.post(`${baseUrl}/resetFailed?siteName=${site}`)
+      )
+    ).then(() => {
+      // refresh the table
+      setLazyParams({ ...lazyParams })
+    })
+  }
 
   const onPage = (event) => {
     setLazyParams(event)
@@ -192,6 +208,11 @@ const SiteSyncSummary = ({
             onChange={(e) => updateSite(e, "remote")}
             options={remoteSites} optionLabel="name"
             placeholder="Remote site" className="w-full md:w-14rem" />
+      <Button
+            label="Retry all failed"
+            icon="refresh"
+            onClick={retryAllFailed}
+            style={{ alignSelf: 'flex-start' }} />
         <TablePanel loading={loading}>
           <DataTable
             scrollable

@@ -1,6 +1,6 @@
 import axios from 'axios'
-import { useState, useEffect } from 'react'
-import { TablePanel } from '@ynput/ayon-react-components'
+import { useState, useEffect, useCallback } from 'react'
+import { Button, TablePanel } from '@ynput/ayon-react-components'
 
 import { Dialog } from 'primereact/dialog'
 import { DataTable } from 'primereact/datatable'
@@ -83,7 +83,7 @@ const SiteSyncDetail = ({
   const [files, setFiles] = useState([])
   const [loading, setLoading] = useState(false)
 
-  useEffect(() => {
+  const loadFiles = useCallback(() => {
     setLoading(true)
 
     axios
@@ -99,7 +99,6 @@ const SiteSyncDetail = ({
         }
 
         let result = []
-        let representation = response.data.representations
         for (const repre of response.data.representations) {
             for (const file of repre.files){
                 result.push({
@@ -116,9 +115,32 @@ const SiteSyncDetail = ({
       .finally(() => {
         setLoading(false)
       })
-
     // eslint-disable-next-line
   }, [projectName, representationId, localSite, remoteSite])
+
+  useEffect(() => {
+    loadFiles()
+  }, [loadFiles])
+
+  const anyFailed = files.some(
+    (file) =>
+      file.localStatus.status === 2 || file.remoteStatus.status === 2
+  )
+
+  const retryFailed = () => {
+    // requeue failed files of this representation on both sites; only
+    // FAILED files are touched server-side
+    setLoading(true)
+    const sites = [...new Set([localSite, remoteSite].filter(Boolean))]
+    Promise.allSettled(
+      sites.map((site) =>
+        axios.post(
+          `${baseUrl}/resetFailed` +
+            `?siteName=${site}&representationId=${representationId}`
+        )
+      )
+    ).then(() => loadFiles())
+  }
 
   return (
     <Dialog
@@ -126,6 +148,15 @@ const SiteSyncDetail = ({
       header="Site sync details"
       onHide={onHide}
       style={{ minHeight: '40%', minWidth: 900 }}
+      footer={
+        anyFailed && (
+          <Button
+            label="Retry failed files"
+            icon="refresh"
+            onClick={retryFailed}
+          />
+        )
+      }
     >
       <TablePanel className="nopad transparent" loading={loading}>
         <SiteSyncDetailTable

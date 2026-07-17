@@ -10,15 +10,11 @@ const SYNC_STATES = [
 ]
 
 const formatStatus = (statusObj) => {
-   let failed_msg = "Failed"
-   if (statusObj["message"] !== null){
-       failed_msg = statusObj["message"]
-   }
   const cell = {
     '-1': { label: 'N/A', color: 'red' },
     0: { label: 'In progress', color: '#dddd11' },
     1: { label: 'Queued', color: '#ccccff' },
-    2: { label:  failed_msg, color: 'red' },
+    2: { label: 'Failed', color: 'red' },
     3: { label: 'Paused', color: '#0012ff' },
     4: { label: 'Synced', color: '#00ffaa' },
   }[statusObj['status']]
@@ -36,6 +32,25 @@ const formatStatus = (statusObj) => {
         showValue={false}
         style={{ width: '100%', height: '100%' }}
       />
+    )
+  }
+
+  if (statusObj.status === 2) {
+    // show the stored error, wrapped and with a tooltip carrying the
+    // full text - it used to be truncated by the column width with no
+    // way to read the rest
+    const message = statusObj.message || 'Failed'
+    return (
+      <span
+        style={{
+          color: cell.color,
+          whiteSpace: 'normal',
+          overflowWrap: 'anywhere',
+        }}
+        title={message}
+      >
+        {message}
+      </span>
     )
   }
 

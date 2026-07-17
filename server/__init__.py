@@ -63,6 +63,12 @@ class SiteSync(BaseServerAddon):
         )
 
         self.add_endpoint(
+            "/{project_name}/state/resetFailed",
+            self.reset_failed_representations,
+            method="POST",
+        )
+
+        self.add_endpoint(
             "/{project_name}/state/{representation_id}/{site_name}",  # noqa
             self.set_site_sync_representation_state,
             method="POST",
@@ -412,6 +418,81 @@ class SiteSync(BaseServerAddon):
     #
     # SET REPRESENTATION SYNC STATE
     #
+
+    async def reset_failed_representations(
+        self,
+        project_name: ProjectName,
+        user: CurrentUser,
+        site_name: str = Query(..., alias="siteName"),
+        representation_id: str | None = Query(
+            None,
+            alias="representationId",
+            description="Limit the reset to a single representation",
+        ),
+    ) -> dict[str, int]:
+        """Requeue FAILED files of a site so clients retry them.
+
+        Without 'representationId' every failed representation of the
+        site is reset ("retry all failed"); with it only that one.
+        Only files in FAILED state are touched - their status goes back
+        to QUEUED and 'retries'/'message' are cleared.
+        """
+        await check_sync_status_table(project_name)
+
+        reset_count = 0
+        async with Postgres.acquire() as conn:
+            async with conn.transaction():
+                if representation_id:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT representation_id, data
+                        FROM project_{project_name}.sitesync_files_status
+                        WHERE site_name = $1 AND representation_id = $2
+                        FOR UPDATE
+                        """,
+                        site_name,
+                        representation_id,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT representation_id, data
+                        FROM project_{project_name}.sitesync_files_status
+                        WHERE site_name = $1 AND status = $2
+                        FOR UPDATE
+                        """,
+                        site_name,
+                        StatusEnum.FAILED,
+                    )
+
+                for row in rows:
+                    files = (row["data"] or {}).get("files") or {}
+                    changed = False
+                    for file_info in files.values():
+                        if file_info.get("status") != StatusEnum.FAILED:
+                            continue
+                        file_info["status"] = StatusEnum.QUEUED
+                        file_info.pop("retries", None)
+                        file_info.pop("message", None)
+                        changed = True
+                    if not changed:
+                        continue
+
+                    status = get_overal_status(files)
+                    await conn.execute(
+                        f"""
+                        UPDATE project_{project_name}.sitesync_files_status
+                        SET status = $1, data = $2
+                        WHERE representation_id = $3 AND site_name = $4
+                        """,
+                        status,
+                        {"files": files},
+                        row["representation_id"],
+                        site_name,
+                    )
+                    reset_count += 1
+
+        return {"resetCount": reset_count}
 
     async def set_site_sync_representation_state(
         self,
