@@ -1656,14 +1656,27 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
 
     def _run_doctor_checks(self):
-        """Detect the invisible per-site 'enabled: false' override.
+        """Detect silent do-nothing states at tray start.
 
-        The AYON settings UI can store an 'enabled: false' override for a
-        user's site that is neither visible nor editable in any UI, and
-        it silently disables sync for that machine only (see CLAUDE.md
-        'Deployment Trap'). Detected by comparing project-level settings
-        with site-resolved ones. Runs in a worker thread at tray start.
+        Two checks, both in a worker thread:
+
+        1. The invisible per-site 'enabled: false' override: the AYON
+           settings UI can store it for a user's site where it is
+           neither visible nor editable, silently disabling sync for
+           that machine only (see CLAUDE.md 'Deployment Trap').
+           Detected by comparing project-level settings with
+           site-resolved ones.
+        2. Machine not opted in: since the per-site 'sync_enabled'
+           opt-in, an enabled project on a machine with the toggle off
+           resolves active==remote and everything legitimately stands
+           down. That is the designed silent default for studio
+           workstations, so this only ever LOGS - except when the
+           machine shows evidence it used to sync (a stale role file or
+           a non-empty auto-download ledger), which means an upgrade
+           just turned a working remote machine silent; then one tray
+           bubble explains how to opt back in.
         """
+        idle_projects = []
         try:
             for project_name in get_project_names():
                 try:
@@ -1677,27 +1690,92 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                         self.name, self.version, project_name,
                         use_site=True
                     )
-                    if site_level.get("enabled"):
+                    if not site_level.get("enabled"):
+                        message = (
+                            "Site Sync is ON for project '{}' but a hidden"
+                            " override disables it for this machine - nothing"
+                            " will sync here. Ask your admin to delete the"
+                            " 'enabled' override for your site (see the"
+                            " deployment-trap note in the Site Sync docs)."
+                        ).format(project_name)
+                        self.log.warning(message)
+                        if getattr(self, "tray_initialized", False):
+                            self.execute_in_main_thread(
+                                functools.partial(
+                                    self.show_tray_message,
+                                    "Site Sync",
+                                    message
+                                )
+                            )
                         continue
+
+                    if (
+                        self.get_active_site(project_name)
+                        == self.get_remote_site(project_name)
+                    ):
+                        idle_projects.append(project_name)
                 except ayon_api.exceptions.HTTPRequestError:
                     continue
-
-                message = (
-                    "Site Sync is ON for project '{}' but a hidden"
-                    " override disables it for this machine - nothing"
-                    " will sync here. Ask your admin to delete the"
-                    " 'enabled' override for your site (see the"
-                    " deployment-trap note in the Site Sync docs)."
-                ).format(project_name)
-                self.log.warning(message)
-                if getattr(self, "tray_initialized", False):
-                    self.execute_in_main_thread(
-                        functools.partial(
-                            self.show_tray_message, "Site Sync", message
-                        )
-                    )
         except Exception:
             self.log.warning("Site Sync doctor check failed", exc_info=True)
+
+        if idle_projects:
+            self._notify_not_opted_in(idle_projects)
+
+    def _notify_not_opted_in(self, project_names):
+        """Explain the not-opted-in idle state instead of pure silence.
+
+        Always logs. Shows a one-time tray bubble ONLY when the machine
+        looks like it synced before (stale 'role' machine pref from
+        pre-opt-in builds, or a non-empty auto-download ledger) - a
+        studio workstation that never opted in must stay popup-free,
+        per the opt-in design decision.
+        """
+        try:
+            message = (
+                "Site sync is installed and enabled for project(s) {} but"
+                " this machine is not opted in - it stays idle (no"
+                " downloads, uploads or mirrors). To work remotely, turn"
+                " on 'Use site sync on this machine' on the project's"
+                " Site Settings page and restart the tray.".format(
+                    ", ".join("'{}'".format(name) for name in project_names)
+                )
+            )
+            self.log.warning(message)
+
+            previously_synced = False
+            # pre-opt-in builds stored the machine role here; the key is
+            # ignored since the opt-in change but proves past sync use
+            if get_machine_pref("role") == ROLE_REMOTE:
+                previously_synced = True
+            else:
+                try:
+                    from ayon_core.lib import get_launcher_local_dir
+
+                    ledger_path = get_launcher_local_dir(
+                        "sitesync_autodownload.json"
+                    )
+                    previously_synced = (
+                        os.path.exists(ledger_path)
+                        and os.path.getsize(ledger_path) > 2  # not '{}'
+                    )
+                except Exception:
+                    pass
+
+            if previously_synced and getattr(
+                self, "tray_initialized", False
+            ):
+                self.execute_in_main_thread(
+                    functools.partial(
+                        self.show_tray_message,
+                        "Site Sync",
+                        message
+                    )
+                )
+        except Exception:
+            self.log.warning(
+                "Couldn't report the not-opted-in state", exc_info=True
+            )
 
     @property
     def is_running(self):

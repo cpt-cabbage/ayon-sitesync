@@ -327,6 +327,17 @@ remotely", so no role question is ever asked:
 - Rollout shape: project `enabled` stays true studio-wide; an admin (via
   API/web) or the artist (Site Settings page) flips `sync_enabled` per
   site. Machines never opted in stay silent — no popups, no probes.
+- **Doctor exception to the no-popups rule** (added 2026-07-18 after a
+  machine that used to sync went silent post-upgrade with zero
+  explanation): `_run_doctor_checks` detects enabled projects where
+  active==remote (the not-opted-in idle state) and always LOGS it; a
+  one-time tray bubble is shown ONLY when the machine has evidence of
+  prior sync use (stale `"role": "remote"` machine pref from pre-opt-in
+  builds, or a non-empty auto-download ledger). Plain studio
+  workstations stay popup-free. Keep the bubble behind that
+  prior-sync-evidence gate.
+- The toggle is stored per PROJECT (project-site settings) — opting a
+  machine in for one project does not opt it in for others.
 
 ## Added on `luma` (`1.3.1+ls.0.9.0`): work-area workfile mirror + log fixes
 
