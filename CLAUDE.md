@@ -166,15 +166,66 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Fixed on `luma` (`1.3.1+ls.0.1.0`): failure isolation & silent-trap fixes
+
+All still present upstream — a merge can reintroduce any of them.
+
+1. **One bad project/site killed sync for everyone.** `sync_loop`'s catch-all
+   called `self.stop()`; `_working_sites` indexed `sync_config.get("sites")[site]`
+   directly (KeyError for a site missing from `sites` settings); rclone's
+   handler raises from `__init__` on bad config. Any of these stopped the whole
+   thread, silently, for all projects. Now: per-project try/except in
+   `sync_loop` (continue to next project), `.get()` + warn-once for missing
+   site configs, provider construction guarded (degrades to "site not
+   working"), and the catch-all logs + sleeps 30s + retries instead of
+   stopping. **Rule: the sync thread must never stop itself** — a dead-silent
+   stopped thread is the worst outcome; keep new failure paths inside the
+   per-project containment.
+2. **`local_drive.is_active()` was hardcoded `True`.** A machine with the
+   studio share unmounted (VPN down) counted as working and every transfer
+   failed file-by-file. Now: studio site requires roots to **exist** (mount
+   points are never created), non-studio sites require roots to be
+   **creatable** (`makedirs exist_ok`). Results cached 30s per
+   (project, site) — handler construction happens on hot paths.
+3. **Unpause was broken**: `status_entity.remove("pause")` — dicts have no
+   `.remove` — now `.pop("pause", None)` (`update_db`).
+4. **`validate_project` used `repre_file["_id"]`** (KeyError; AYON uses
+   `"id"`). Method is dormant but is the "adopt files already on disk"
+   feature; fixed ahead of wiring it to the tray menu.
+5. **"Remove from local" rmdir traceback** (§1b below): `_remove_local_file`
+   now warns and continues when the empty-folder `rmdir` fails; `os.remove`
+   failures still raise.
+6. **Silent 403 project drops** (settings unreadable → project skipped at
+   debug level) are now deduplicated **warnings**
+   (`_warn_missing_permission`).
+7. **Server roll-up masked live transfers**: `get_overal_status` now ranks
+   IN_PROGRESS above FAILED — a representation reads FAILED only once nothing
+   is still moving.
+
 ## Fixed on `luma`: manual transfers waited out `loop_delay`
 
 **Fixed in `1.3.1+ls.0.0.4`. Still present upstream — a merge can reintroduce it.**
 
 Clicking **Download**/**Upload** in the Loader or Scene Inventory created the site
 record but did not wake the sync loop, so nothing moved for up to `loop_delay`
-(60s default). Same for the upload after a publish. `reset_timer()` existed and
-already worked cross-process, but its **only** caller was the launch hook
-(`sitesync.py:309`) — `add_site` never called it.
+(60s default). Same for the upload after a publish. `reset_timer()` existed but its
+**only** caller was the launch hook (`sitesync.py:309`) — `add_site` never called
+it.
+
+**Correction (`1.3.1+ls.0.1.0`):** the claim that the REST wake "already worked
+cross-process" was **wrong**. `_reset_timer_with_rest_api` POSTs
+`{AYON_WEBSERVER_URL}/sitesync/reset_timer`, but the addon never implemented
+`webserver_initialization(server_manager)` — the only hook core's tray webserver
+uses to let addons register routes (`tools/tray/webserver/server.py::
+connect_with_addons`). The POST was a silent **404** (`requests.post` doesn't
+raise on it), so from a DCC publish or the launch hook the wake did nothing and
+transfers still waited out `loop_delay`. Only the in-tray direct call worked.
+Fixed in `+ls.0.1.0`: `SiteSyncAddon.webserver_initialization` registers
+`POST /sitesync/reset_timer` (calling `sitesync_thread.reset_timer()` directly —
+NOT `self.reset_timer()`, which would recurse into the POST when the thread is
+absent), `_reset_timer_with_rest_api` now logs non-2xx responses, and
+`SiteSyncThread.reset_timer` cancels the timer via `loop.call_soon_threadsafe`
+because callers live in foreign threads (tray UI, webserver route).
 
 **Fix:** `add_site` now calls `self.reset_timer()` after writing the state.
 
@@ -618,7 +669,7 @@ doing *if* the model is kept; none of them changes the fit.
 
 See *"Fixed on `luma`: manual transfers waited out `loop_delay`"* below.
 
-### 1b. "Remove from local" raises on a cosmetic `rmdir` failure
+### 1b. ~~"Remove from local" raises on a cosmetic `rmdir` failure~~ — FIXED in `1.3.1+ls.0.1.0`
 
 Reported 2026-07-17 on `1.3.1+ls.0.0.4`, removing a representation from the local
 site via the Loader:
