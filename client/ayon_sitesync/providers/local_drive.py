@@ -12,6 +12,12 @@ from ayon_core.addon import AddonsManager
 
 log = Logger.get_logger("SiteSync")
 
+# Root reachability is re-checked by every handler construction (sync loop,
+# path resolving during publish) - cache it briefly so the extra Anatomy
+# fetches and disk probes don't multiply.
+_ROOT_CHECK_TTL = 30
+_root_check_cache = {}
+
 
 class LocalDriveHandler(AbstractProvider):
     CODE = "local_drive"
@@ -28,6 +34,71 @@ class LocalDriveHandler(AbstractProvider):
         self.active = self.is_active()
 
     def is_active(self):
+        """Check that the site's roots are actually usable on this machine.
+
+        Used to be hardcoded ``True``, so a machine with the studio share
+        unmounted (VPN down, drive letter gone) counted as "working" and
+        every transfer failed file-by-file. Now the studio site requires
+        its root folders to exist (they are mount points - never create
+        them), while a local site only requires its roots to be creatable.
+        """
+        cache_key = (self.project_name, self.site_name)
+        cached = _root_check_cache.get(cache_key)
+        if cached is not None and time.time() - cached[0] < _ROOT_CHECK_TTL:
+            return cached[1]
+
+        result = self._check_roots()
+        _root_check_cache[cache_key] = (time.time(), result)
+        return result
+
+    def _check_roots(self):
+        try:
+            roots = self.get_roots_config().get("root") or {}
+        except Exception:
+            log.warning(
+                "Couldn't resolve roots for site '{}' of project '{}'".format(
+                    self.site_name, self.project_name),
+                exc_info=True
+            )
+            return False
+
+        if not roots:
+            log.warning(
+                "No roots configured for site '{}' of project '{}'".format(
+                    self.site_name, self.project_name)
+            )
+            return False
+
+        is_studio = self.site_name == "studio"
+        for root_name, root in roots.items():
+            # values are RootItem objects from Anatomy or plain strings
+            # from the siteRoots endpoint
+            root_path = getattr(root, "value", root)
+            if not root_path:
+                log.warning(
+                    "Root '{}' of site '{}' in project '{}' has no value"
+                    " on this platform".format(
+                        root_name, self.site_name, self.project_name)
+                )
+                return False
+            if is_studio:
+                if not os.path.isdir(root_path):
+                    log.warning(
+                        "Studio root '{}' ({}) is not reachable from this"
+                        " machine - is the share mounted?".format(
+                            root_name, root_path)
+                    )
+                    return False
+            else:
+                try:
+                    os.makedirs(root_path, exist_ok=True)
+                except OSError:
+                    log.warning(
+                        "Local root '{}' ({}) cannot be created".format(
+                            root_name, root_path),
+                        exc_info=True
+                    )
+                    return False
         return True
 
     def upload_file(

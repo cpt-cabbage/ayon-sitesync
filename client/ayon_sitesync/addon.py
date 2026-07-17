@@ -110,6 +110,25 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         # projects that long tasks are running on
         self.projects_processed = set()
 
+        # projects already warned about missing settings permissions
+        self._permission_warned_projects = set()
+
+    def _warn_missing_permission(self, project_name):
+        """Warn once that a project's settings are not readable.
+
+        Called from code that runs every sync loop - deduplicated so a
+        permanent permission problem doesn't flood the log while still
+        being findable in it (it used to be a debug message, making the
+        dropped project invisible).
+        """
+        if project_name in self._permission_warned_projects:
+            return
+        self._permission_warned_projects.add(project_name)
+        self.log.warning(
+            f"Missing permission to access settings of "
+            f"'{project_name}' - it will not be synced."
+        )
+
     @property
     def endpoint_prefix(self):
         return "addons/{}/{}".format(self.name, self.version)
@@ -558,7 +577,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                             project_name,
                             repre_id,
                             site_name=site_name,
-                            file_id=repre_file["_id"]
+                            file_id=repre_file["id"]
                         )
                         sites_reset += 1
 
@@ -894,7 +913,17 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         # unreachable or hung tray webserver would otherwise fail the publish.
         # A timeout is required: `requests` waits forever by default.
         try:
-            requests.post(rest_api_url, timeout=2)
+            response = requests.post(rest_api_url, timeout=2)
+            if not response.ok:
+                # A 404 means the tray webserver has no such route - most
+                # likely a tray running an addon version without
+                # `webserver_initialization`. The transfer still happens,
+                # just after `loop_delay` instead of immediately.
+                self.log.warning(
+                    "Reset sync timer request to {} returned {}".format(
+                        rest_api_url, response.status_code
+                    )
+                )
         except Exception:
             self.log.warning(
                 "Couldn't reset sync timer via {}".format(rest_api_url),
@@ -929,10 +958,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                     )
                 except ayon_api.exceptions.HTTPRequestError as exp:
                     if exp.response.status_code == 403:
-                        self.log.debug(
-                            f"Doesn't have permission to access settings of "
-                            f"'{project_name}', skipping."
-                        )
+                        # Warning, not debug: the project looks enabled but
+                        # will never sync for this user - that must be
+                        # findable in the log.
+                        self._warn_missing_permission(project_name)
                         return False
                     raise
 
@@ -1131,6 +1160,33 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 "SiteSync is not enabled. Site Sync server was not started."
             )
 
+    def webserver_initialization(self, server_manager):
+        """Register routes on the tray webserver.
+
+        `_reset_timer_with_rest_api` POSTs to this route from other
+        processes (a DCC publish, the launch hook). Before this method
+        existed the POST was a silent 404 - `requests.post` does not raise
+        on it - so cross-process wake-ups never actually skipped the wait.
+        """
+        if not self.enabled:
+            return
+
+        async def _reset_timer_route(_request):
+            from aiohttp.web import Response
+
+            # Call the thread directly instead of `self.reset_timer()`:
+            # that helper falls back to POSTing this very route when the
+            # thread is not running, which would recurse.
+            thread = self.sitesync_thread
+            if thread is not None:
+                self.log.debug("Sync timer reset requested via webserver")
+                thread.reset_timer()
+            return Response(status=200)
+
+        server_manager.add_route(
+            "POST", "/sitesync/reset_timer", _reset_timer_route
+        )
+
     def tray_exit(self):
         """Stops sync thread if running.
 
@@ -1218,10 +1274,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 )
             except ayon_api.exceptions.HTTPRequestError as exp:
                 if exp.response.status_code == 403:
-                    self.log.debug(
-                        f"Doesn't have permission to access settings of "
-                        f"'{project_name}', skipping."
-                    )
+                    self._warn_missing_permission(project_name)
                     continue
                 raise
 
@@ -1563,7 +1616,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                     if pause:
                         status_entity["pause"] = True
                     else:
-                        status_entity.remove("pause")
+                        status_entity.pop("pause", None)
                 files_status.append(status_entity)
 
         representation_id = repre_status["representationId"]
@@ -2108,9 +2161,14 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             try:
                 os.rmdir(folder)
             except OSError:
-                msg = "folder {} cannot be removed".format(folder)
-                self.log.warning(msg)
-                raise ValueError(msg)
+                # Removing the now-empty directory is incidental cleanup -
+                # the files are already gone and the server-side record was
+                # already deleted, so failing here (e.g. a cloud-sync tool
+                # holding a handle) must not abort the removal nor show the
+                # artist a traceback for an operation that succeeded.
+                self.log.warning(
+                    "folder {} cannot be removed".format(folder)
+                )
 
     def reset_timer(self):
         """

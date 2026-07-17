@@ -333,6 +333,7 @@ class SiteSyncThread(threading.Thread):
         self.is_running = False
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
         self.timer = None
+        self._warned_keys = set()
 
     def run(self):
         self.is_running = True
@@ -375,7 +376,19 @@ class SiteSyncThread(threading.Thread):
                 project_name = None
                 enabled_projects = self.addon.get_enabled_projects()
                 for project_name in enabled_projects:
-                    await self._sync_project(project_name)
+                    # One broken project (bad site config, provider raising
+                    # in its constructor, transient DB error) must not stop
+                    # syncing for every other project - contain it here.
+                    try:
+                        await self._sync_project(project_name)
+                    except asyncio.exceptions.CancelledError:
+                        raise
+                    except Exception:
+                        self.log.warning(
+                            "Failed to process project '{}', skipping it"
+                            " this loop".format(project_name),
+                            exc_info=True
+                        )
 
                 duration = time.time() - start_time
                 self.log.debug("One loop took {:.2f}s".format(duration))
@@ -399,10 +412,16 @@ class SiteSyncThread(threading.Thread):
                     "ResumableError in sync loop, trying next loop",
                     exc_info=True)
             except Exception:
-                self.stop()
+                # A silently stopped thread is the worst possible outcome:
+                # nothing syncs anywhere and there is no user-visible signal.
+                # Log loudly and try again next loop instead of stopping.
                 self.log.warning(
-                    "Unhandled except. in sync loop, stopping server",
+                    "Unhandled except. in sync loop, trying next loop",
                     exc_info=True)
+                # The failure may have happened before the loop's own timer
+                # ran (e.g. fetching settings), so wait here to avoid
+                # hammering an unreachable server in a hot loop.
+                await asyncio.sleep(30)
 
     def stop(self):
         """Sets is_running flag to false, 'check_shutdown' shuts server down"""
@@ -443,13 +462,34 @@ class SiteSyncThread(threading.Thread):
     def reset_timer(self):
         """Called when waiting for next loop should be skipped"""
         self.log.debug("Resetting timer")
-        if self.timer:
-            self.timer.cancel()
-            self.timer = None
+        timer = self.timer
+        if timer is None:
+            return
+        self.timer = None
+        loop = self.loop
+        if loop is not None and loop.is_running():
+            # Callers live in other threads (tray UI, tray webserver route)
+            # while the timer task belongs to this thread's event loop -
+            # cancelling directly from a foreign thread is not safe.
+            loop.call_soon_threadsafe(timer.cancel)
+        else:
+            timer.cancel()
+
+    def _warn_once(self, key, message, exc_info=False):
+        """Log a warning only once per thread lifetime for given 'key'.
+
+        The sync loop revisits the same misconfiguration every iteration;
+        without deduplication a persistent problem floods the log until the
+        real message drowns.
+        """
+        if key not in self._warned_keys:
+            self._warned_keys.add(key)
+            self.log.warning(message, exc_info=exc_info)
 
     def _working_sites(self, project_name, sync_config):
         if self.addon.is_project_paused(project_name):
-            self.log.debug("Both sites same, skipping")
+            self.log.debug(
+                "Project '{}' is paused, skipping".format(project_name))
             return None, None
 
         local_site = self.addon.get_active_site(project_name)
@@ -459,20 +499,55 @@ class SiteSyncThread(threading.Thread):
                 local_site, remote_site))
             return None, None
 
-        local_site_config = sync_config.get("sites")[local_site]
-        remote_site_config = sync_config.get("sites")[remote_site]
-        if not all([
-            _site_is_working(
-                self.addon, project_name, local_site, local_site_config
-            ),
-            _site_is_working(
-                self.addon, project_name, remote_site, remote_site_config
-            )
-        ]):
-            self.log.debug((
-                "Some of the sites {} - {} in {} is not working properly"
-            ).format(local_site, remote_site, project_name))
+        sites_config = sync_config.get("sites") or {}
+        for site_name in (local_site, remote_site):
+            # A direct [site_name] KeyError here used to propagate and kill
+            # the sync loop for every project.
+            if site_name not in sites_config:
+                self._warn_once(
+                    (project_name, site_name, "unconfigured"),
+                    (
+                        "Site '{}' used by project '{}' is not configured"
+                        " in its SiteSync 'sites' settings - skipping the"
+                        " project."
+                    ).format(site_name, project_name)
+                )
+                return None, None
 
+        try:
+            sites_working = all([
+                _site_is_working(
+                    self.addon, project_name, local_site,
+                    sites_config[local_site]
+                ),
+                _site_is_working(
+                    self.addon, project_name, remote_site,
+                    sites_config[remote_site]
+                )
+            ])
+        except Exception:
+            # Provider handlers (e.g. rclone) may raise from their
+            # constructor on bad configuration - degrade to "site not
+            # working" instead of letting it crash the loop.
+            self._warn_once(
+                (project_name, local_site, remote_site, "provider_error"),
+                (
+                    "Misconfigured provider for sites {} - {} in project"
+                    " '{}', skipping the project."
+                ).format(local_site, remote_site, project_name),
+                exc_info=True
+            )
+            return None, None
+
+        if not sites_working:
+            self._warn_once(
+                (project_name, local_site, remote_site, "not_working"),
+                (
+                    "Some of the sites {} - {} in {} is not working properly"
+                    " (missing credentials, unreachable root or misconfigured"
+                    " provider) - project is skipped until it recovers."
+                ).format(local_site, remote_site, project_name)
+            )
             return None, None
 
         return local_site, remote_site
