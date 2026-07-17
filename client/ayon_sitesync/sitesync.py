@@ -371,7 +371,14 @@ class SiteSyncThread(threading.Thread):
         Returns:
 
         """
-        while self.is_running and not self.addon.is_paused():
+        while self.is_running:
+            # Skip work while paused instead of exiting: with the pause
+            # check in the 'while' condition (previous behaviour) pausing
+            # ended this coroutine permanently and resume never worked -
+            # which is why the tray couldn't offer pause/resume.
+            if self.addon.is_paused():
+                await asyncio.sleep(5)
+                continue
             try:
                 start_time = time.time()
                 self.addon.set_sync_project_settings()  # clean cache

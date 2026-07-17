@@ -1,4 +1,5 @@
 
+import functools
 import os
 import sys
 import time
@@ -119,6 +120,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
         # projects already warned about missing settings permissions
         self._permission_warned_projects = set()
+
+        # throttle for tray failure notifications, per project
+        self._last_notification_by_project = {}
+        self._pause_action = None
 
         # zero-touch machine role, resolved once per process per project -
         # a role flip mid-session would change every resolved path
@@ -1315,6 +1320,12 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         """
         self.server_start()
         self._schedule_machine_role_prompt()
+        if self.enabled:
+            # detect the invisible per-site 'enabled: false' override
+            # without blocking tray startup on network calls
+            threading.Thread(
+                target=self._run_doctor_checks, daemon=True
+            ).start()
 
     def _schedule_machine_role_prompt(self):
         """Schedule the one-time 'studio or remote?' prompt.
@@ -1400,7 +1411,206 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
 
     def tray_menu(self, parent_menu):
-        pass
+        """Site Sync submenu in the tray.
+
+        Wires the long-dormant pause/resume and 'validate_project' APIs
+        to something an artist can actually click.
+        """
+        if not self.enabled:
+            return
+        from qtpy import QtWidgets
+
+        menu = QtWidgets.QMenu("Site Sync", parent_menu)
+        menu.setProperty("submenu", "on")
+
+        sync_now_action = QtWidgets.QAction("Sync now", menu)
+        sync_now_action.triggered.connect(self._on_tray_sync_now)
+        menu.addAction(sync_now_action)
+
+        pause_action = QtWidgets.QAction("Pause syncing", menu)
+        pause_action.setCheckable(True)
+        pause_action.setChecked(self.is_paused())
+        pause_action.triggered.connect(self._on_tray_pause_toggle)
+        menu.addAction(pause_action)
+        self._pause_action = pause_action
+
+        menu.addSeparator()
+
+        validate_action = QtWidgets.QAction(
+            "Adopt existing local files", menu
+        )
+        validate_action.setToolTip(
+            "Scan the local folder and mark files that are already"
+            " present as synced, so they are not downloaded again."
+        )
+        validate_action.triggered.connect(self._on_tray_validate)
+        menu.addAction(validate_action)
+
+        web_action = QtWidgets.QAction("Open sync status page...", menu)
+        web_action.triggered.connect(self._on_tray_open_web)
+        menu.addAction(web_action)
+
+        parent_menu.addMenu(menu)
+
+    def _on_tray_sync_now(self):
+        self.log.info("Manual sync requested from tray")
+        self.reset_timer()
+
+    def _on_tray_pause_toggle(self, checked=False):
+        if checked:
+            self.pause_server()
+        else:
+            self.unpause_server()
+            # resume immediately instead of waiting out the pause poll
+            self.reset_timer()
+
+    def _on_tray_validate(self):
+        """Schedule 'adopt existing local files' for enabled projects.
+
+        Runs through the sync thread's 'long_running_tasks' queue so the
+        (potentially long) whole-project scan doesn't block the UI or a
+        sync pass.
+        """
+        try:
+            local_site = get_local_site_id()
+            scheduled = []
+            for project_name in self.get_enabled_projects():
+                if self.get_active_site(project_name) != local_site:
+                    continue
+                if project_name in self.projects_processed:
+                    continue
+                self.projects_processed.add(project_name)
+                self.long_running_tasks.append({
+                    # must never raise: an exception would kill the sync
+                    # thread's 'check_shutdown' consumer
+                    "func": functools.partial(
+                        self._safe_validate_project,
+                        project_name,
+                        local_site,
+                    ),
+                    "project_name": project_name,
+                })
+                scheduled.append(project_name)
+            if scheduled:
+                message = (
+                    "Checking local files of: {}. Files already on disk"
+                    " will be marked as synced.".format(
+                        ", ".join(scheduled))
+                )
+            else:
+                message = (
+                    "No project to check - this machine is not an active"
+                    " local site for any enabled project."
+                )
+            self.show_tray_message("Site Sync", message)
+        except Exception:
+            self.log.warning(
+                "Couldn't schedule local files validation", exc_info=True
+            )
+
+    def _safe_validate_project(self, project_name, site_name):
+        try:
+            self.validate_project(project_name, site_name)
+        except Exception:
+            self.log.warning(
+                "Validation of local files failed for '{}'".format(
+                    project_name),
+                exc_info=True
+            )
+
+    def _on_tray_open_web(self):
+        import webbrowser
+
+        url = ayon_api.get_base_url()
+        try:
+            enabled_projects = self.get_enabled_projects()
+            if len(enabled_projects) == 1:
+                url = "{}/projects/{}/addon/sitesync".format(
+                    url, enabled_projects[0]
+                )
+        except Exception:
+            self.log.debug(
+                "Couldn't resolve project page, opening server root",
+                exc_info=True
+            )
+        webbrowser.open(url)
+
+    def _notify_failed_transfer(self, project_name, file_path, error):
+        """Throttled tray bubble when a transfer flips to FAILED.
+
+        Called from the sync thread - the actual Qt call is marshalled to
+        the main thread. Never raises and does nothing outside the tray.
+        """
+        try:
+            if not getattr(self, "tray_initialized", False):
+                return
+            now = time.time()
+            last = self._last_notification_by_project.get(project_name, 0)
+            if now - last < 300:
+                return
+            self._last_notification_by_project[project_name] = now
+
+            file_label = ""
+            if file_path:
+                file_label = " ('{}')".format(os.path.basename(file_path))
+            message = (
+                "A file transfer for project '{}' failed{}: {}. See the"
+                " sync status page for details and retry.".format(
+                    project_name, file_label, error or "unknown error")
+            )
+            self.execute_in_main_thread(
+                functools.partial(
+                    self.show_tray_message, "Site Sync", message
+                )
+            )
+        except Exception:
+            self.log.warning(
+                "Couldn't show failed-transfer notification", exc_info=True
+            )
+
+    def _run_doctor_checks(self):
+        """Detect the invisible per-site 'enabled: false' override.
+
+        The AYON settings UI can store an 'enabled: false' override for a
+        user's site that is neither visible nor editable in any UI, and
+        it silently disables sync for that machine only (see CLAUDE.md
+        'Deployment Trap'). Detected by comparing project-level settings
+        with site-resolved ones. Runs in a worker thread at tray start.
+        """
+        try:
+            for project_name in get_project_names():
+                try:
+                    project_level = get_addon_project_settings(
+                        self.name, self.version, project_name,
+                        use_site=False
+                    )
+                    if not project_level.get("enabled"):
+                        continue
+                    site_level = get_addon_project_settings(
+                        self.name, self.version, project_name,
+                        use_site=True
+                    )
+                    if site_level.get("enabled"):
+                        continue
+                except ayon_api.exceptions.HTTPRequestError:
+                    continue
+
+                message = (
+                    "Site Sync is ON for project '{}' but a hidden"
+                    " override disables it for this machine - nothing"
+                    " will sync here. Ask your admin to delete the"
+                    " 'enabled' override for your site (see the"
+                    " deployment-trap note in the Site Sync docs)."
+                ).format(project_name)
+                self.log.warning(message)
+                if getattr(self, "tray_initialized", False):
+                    self.execute_in_main_thread(
+                        functools.partial(
+                            self.show_tray_message, "Site Sync", message
+                        )
+                    )
+        except Exception:
+            self.log.warning("Site Sync doctor check failed", exc_info=True)
 
     @property
     def is_running(self):
@@ -1805,6 +2015,11 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                     status_entity["message"] = error
                     if tries >= max_retries:
                         status_entity["status"] = SiteSyncStatus.FAILED
+                        self._notify_failed_transfer(
+                            project_name,
+                            file.get("path") if file else None,
+                            error
+                        )
                 elif pause is not None:
                     if pause:
                         status_entity["pause"] = True
