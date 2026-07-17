@@ -166,6 +166,24 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (`1.3.1+ls.0.8.0`): live sync-queue visibility
+
+- **Tray "Show sync queue…" window** (`tray_queue_window.py`,
+  `SyncQueueWindow`, singleton on the addon): queued / in-progress (with %)
+  / failed / paused representations across enabled projects, direction
+  inferred from which side still has work, "Retry all failed" via the
+  `resetFailed` endpoint. Polls the addon's `/state` endpoint every 4s
+  **only while visible** (QTimer in show/hideEvent); fetches run in worker
+  threads with results marshalled back through a Qt signal - keep it that
+  way, REST on the UI thread freezes the tray. NOTE the `/state` endpoint
+  **ANDs** `localStatusFilter` and `remoteStatusFilter`, so "active on
+  either side" requires one call per side merged by representation id.
+  `ayon_api.post` sends kwargs as JSON body - `resetFailed`'s query params
+  must be embedded in the URL.
+- **Web page live progress**: `summary.jsx` silently re-polls every 5s
+  while any visible row is IN_PROGRESS, so the existing progress bars
+  animate. Poll stops automatically when nothing is transferring.
+
 ## Added on `luma` (`1.3.1+ls.0.7.0`): opened-task tracking + artist off-switch
 
 - **Opening a task tracks it for auto-download**, assigned or not: the
