@@ -166,6 +166,35 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (`1.3.1+ls.0.3.0`): auto-download of assigned work
+
+`auto_download.py` (`AutoDownloader`, owned by `SiteSyncThread`, called at the
+top of each per-project loop pass) queues the last published workfile of every
+task assigned to the logged-in user — plus its `reference`-linked
+representations — for download to the local site. Gates: project enabled + not
+paused, `enable_auto_download` (new `config` setting, default on), machine IS
+the artist's local site (`get_active_site == get_local_site_id()`), throttled
+by `auto_download_interval` (default 300s), skipped with a warning below
+`min_free_space_gb` free disk.
+
+**Rules / design notes:**
+- **Ledger** (`<launcher_local_dir>/sitesync_autodownload.json`): every id
+  ever auto-queued is remembered and never re-queued — an artist removing a
+  repre from local must not fight the service. Do not "optimize" the ledger
+  away in favor of pure state checks.
+- Only repres with `remoteStatus == OK` are queued: a queued/NA pair is
+  invisible to the sync loop forever (see the `+ls.0.0.2` section). Not-yet-
+  uploaded work is retried next interval, NOT ledgered.
+- `get_last_published_workfile_representation` moved to `utils.py` and is
+  shared with the launch hook - keep them shared.
+- The launch hook now honors the profile toggle
+  `core → tools → Workfiles → last_workfile_on_startup →
+  use_last_published_workfile` itself (`_use_last_published_workfile_enabled`)
+  - core never read it (see "dead setting" note below); the hook-side check
+  makes the toggle real without a core change. `app_groups` extended with
+  resolve, unreal, substancepainter/designer, motionbuilder, gaffer, openrv,
+  premiere.
+
 ## Added on `luma` (`1.3.1+ls.0.2.0`): zero-touch site configuration
 
 Artists no longer hand-edit site settings. Design (all client-side synthesis —
