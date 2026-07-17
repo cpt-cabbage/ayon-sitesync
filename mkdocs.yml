@@ -3,6 +3,8 @@ repo_url: https://github.com/ynput/ayon-sitesync
 
 nav:
   - Home: index.md
+  - Artist guide: artist.md
+  - Admin guide: admin.md
   - License: license.md
 
 theme:
