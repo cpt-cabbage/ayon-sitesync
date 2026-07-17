@@ -126,7 +126,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         # throttle for tray failure notifications, per project
         self._last_notification_by_project = {}
         self._pause_action = None
-        self._queue_window = None
+        self._control_window = None
 
         # zero-touch machine role, resolved once per process per project -
         # a role flip mid-session would change every resolved path
@@ -614,51 +614,43 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             sites_added, reset_missing
         ))
 
-    # TODO hook to some trigger - no Sync Queue anymore
+    # wired to the tray control window's per-row "Pause syncing"
     def pause_representation(
         self, project_name, representation_id, site_name
     ):
-        """Pause sync of representation entity on site.
+        """Pause sync of representation for this tray session.
 
-        Sets 'representation_id' as paused, eg. no syncing should be
-            happening on it.
+        In-memory only: the sync loop checks 'is_representation_paused'
+        before processing each representation. The upstream version also
+        wrote to the DB via 'update_db', but that call crashed - it was
+        made without the mandatory 'side'/'file' arguments - so the DB
+        write is intentionally gone. The pause does not survive a tray
+        restart.
 
         Args:
-            project_name (str): Project name.
+            project_name (str): Project name (kept for signature parity).
             representation_id (str): Representation id.
-            site_name (str): Site name 'gdrive', 'studio' etc.
+            site_name (str): Site name (kept for signature parity).
 
         """
         self.log.info("Pausing SiteSync for {}".format(representation_id))
         self._paused_representations.add(representation_id)
-        repre_entity = get_representation_by_id(
-            project_name, representation_id
-        )
-        self.update_db(project_name, repre_entity, site_name, pause=True)
 
-    # TODO hook to some trigger - no Sync Queue anymore
     def unpause_representation(
         self, project_name, representation_id, site_name
     ):
-        """Unpause sync of representation entity on site.
+        """Unpause sync of representation.
 
-        Does not fail or warn if repre wasn't paused.
+        Does not fail or warn if repre wasn't paused. See
+        'pause_representation' for why this is in-memory only.
 
         Args:
-            project_name (str): Project name.
+            project_name (str): Project name (kept for signature parity).
             representation_id (str): Representation id.
-            site_name (str): Site name 'gdrive', 'studio' etc.
+            site_name (str): Site name (kept for signature parity).
         """
         self.log.info("Unpausing SiteSync for {}".format(representation_id))
-        try:
-            self._paused_representations.remove(representation_id)
-        except KeyError:
-            pass
-        # self.paused_representations is not persistent
-        repre_entity = get_representation_by_id(
-            project_name, representation_id
-        )
-        self.update_db(project_name, repre_entity, site_name, pause=False)
+        self._paused_representations.discard(representation_id)
 
     def is_representation_paused(
         self, representation_id, check_parents=False, project_name=None
@@ -1416,8 +1408,9 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
     def tray_menu(self, parent_menu):
         """Site Sync submenu in the tray.
 
-        Wires the long-dormant pause/resume and 'validate_project' APIs
-        to something an artist can actually click.
+        Quick toggles only - everything else (auto-download switch,
+        adopt existing files, queue, per-file actions) lives in the
+        control panel window ('tray_control_window.py').
         """
         if not self.enabled:
             return
@@ -1437,38 +1430,11 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         menu.addAction(pause_action)
         self._pause_action = pause_action
 
-        auto_download_action = QtWidgets.QAction(
-            "Auto-download new work", menu
-        )
-        auto_download_action.setCheckable(True)
-        auto_download_action.setChecked(
-            bool(get_machine_pref("auto_download", True))
-        )
-        auto_download_action.setToolTip(
-            "Automatically download published work for your assigned and"
-            " recently opened tasks. Uncheck to stop background"
-            " downloads; your own publishes still upload."
-        )
-        auto_download_action.triggered.connect(
-            self._on_tray_auto_download_toggle
-        )
-        menu.addAction(auto_download_action)
-
         menu.addSeparator()
 
-        queue_action = QtWidgets.QAction("Show sync queue...", menu)
-        queue_action.triggered.connect(self._on_tray_show_queue)
-        menu.addAction(queue_action)
-
-        validate_action = QtWidgets.QAction(
-            "Adopt existing local files", menu
-        )
-        validate_action.setToolTip(
-            "Scan the local folder and mark files that are already"
-            " present as synced, so they are not downloaded again."
-        )
-        validate_action.triggered.connect(self._on_tray_validate)
-        menu.addAction(validate_action)
+        control_action = QtWidgets.QAction("Sync control panel...", menu)
+        control_action.triggered.connect(self._on_tray_show_control)
+        menu.addAction(control_action)
 
         web_action = QtWidgets.QAction("Open sync status page...", menu)
         web_action.triggered.connect(self._on_tray_open_web)
@@ -1480,17 +1446,19 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         self.log.info("Manual sync requested from tray")
         self.reset_timer()
 
-    def _on_tray_show_queue(self):
+    def _on_tray_show_control(self):
         try:
-            if self._queue_window is None:
-                from .tray_queue_window import SyncQueueWindow
+            if self._control_window is None:
+                from .tray_control_window import SyncControlWindow
 
-                self._queue_window = SyncQueueWindow(self)
-            self._queue_window.show()
-            self._queue_window.raise_()
-            self._queue_window.activateWindow()
+                self._control_window = SyncControlWindow(self)
+            self._control_window.show()
+            self._control_window.raise_()
+            self._control_window.activateWindow()
         except Exception:
-            self.log.warning("Couldn't open sync queue window", exc_info=True)
+            self.log.warning(
+                "Couldn't open sync control window", exc_info=True
+            )
 
     def _on_tray_pause_toggle(self, checked=False):
         if checked:
@@ -1499,6 +1467,22 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             self.unpause_server()
             # resume immediately instead of waiting out the pause poll
             self.reset_timer()
+        self._sync_pause_ui(bool(checked))
+
+    def _sync_pause_ui(self, checked):
+        """Keep the tray action and control window checkbox in step.
+
+        Both call '_on_tray_pause_toggle'; 'setChecked' does not re-emit
+        the user-interaction signals ('triggered'/'clicked'), so this
+        cannot loop.
+        """
+        try:
+            if self._pause_action is not None:
+                self._pause_action.setChecked(checked)
+            if self._control_window is not None:
+                self._control_window.set_pause_checked(checked)
+        except Exception:
+            self.log.warning("Couldn't sync pause UI state", exc_info=True)
 
     def _on_tray_auto_download_toggle(self, checked=False):
         try:
@@ -1509,6 +1493,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
             if checked:
                 self.reset_timer()
+            if self._control_window is not None:
+                self._control_window.set_auto_download_checked(
+                    bool(checked)
+                )
         except Exception:
             self.log.warning(
                 "Couldn't persist auto-download preference", exc_info=True

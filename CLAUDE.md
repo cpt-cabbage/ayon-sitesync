@@ -166,6 +166,51 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (unreleased, after `0.9.0`): all-in-one sync control panel
+
+Versioning note: `package.py` deliberately NOT bumped — the user bumps
+versions explicitly, never per change.
+
+`tray_queue_window.py` was renamed/expanded into **`tray_control_window.py`**
+(`SyncQueueWindow` → `SyncControlWindow`, addon singleton `_queue_window` →
+`_control_window`). One window now holds every artist-facing control except
+roots (which stay in Site Settings):
+
+- **Tray menu slimmed** to Sync now / Pause syncing / "Sync control panel..."
+  / web page. The auto-download toggle and "Adopt existing local files"
+  moved INTO the window's controls bar (`_on_tray_auto_download_toggle` and
+  `_on_tray_validate` are now called from the window). Pause state is kept
+  in step between the tray action and the window checkbox via
+  `_sync_pause_ui` — safe because `setChecked` does not re-emit the
+  user-interaction signals (`triggered`/`clicked`), so no feedback loop.
+- **Two self-polling tabs, no Refresh buttons**: "Queue" (4s, cross-project
+  active/failed rows as before) and "All files" (8s; one project at a time,
+  status filter, debounced folder/product search, paged 200/page). Only the
+  visible tab polls; timers stop on hide. Fetches/actions run in worker
+  threads marshalled back via Qt signals — keep it that way.
+- **"All files" filter semantics**: the `/state` endpoint ANDs all filters,
+  so "either side has status X" / "folder OR product matches" is built from
+  up to 4 calls merged by representation id. "Fully synced" is the one
+  genuinely ANDed case (local OK + remote OK, single call). "N/A" is not
+  offered as a filter — an N/A side has no `sitesync_files_status` row, so
+  `status IN (...)` can never match it server-side.
+- **Per-row context menu** (both tabs): retry failed
+  (`resetFailed?siteName=&representationId=`, query params in the URL —
+  `ayon_api.post` sends kwargs as JSON body), download/upload
+  (`add_site(force=True)` — wakes the loop itself), pause/resume this file
+  (session-only, see below), and "Remove download from this machine"
+  (confirm dialog, `remove_site(remove_local_files=True)`, offered ONLY
+  when `local_site == get_local_site_id()` so one artist's tray can never
+  unsync the studio site).
+- **`pause_representation`/`unpause_representation` fixed + wired**: the
+  upstream bodies passed a repre entity to `update_db` without the
+  mandatory `side`/`file` args — guaranteed crash (`KeyError: 'NoneStatus'`
+  / `TypeError` on `file["fileHash"]`). Now in-memory only
+  (`_paused_representations`, which the sync loop already checks per repre
+  in `_sync_project`); a pause lasts until tray restart and the UI labels
+  it "paused this session". Do NOT reintroduce the `update_db` call on an
+  upstream sync.
+
 ## Added on `luma` (`1.3.1+ls.0.9.0`): work-area workfile mirror + log fixes
 
 **Why a mirror and not the sitesync DB** (asked and answered - keep this
@@ -200,7 +245,9 @@ download-only, no progress rows in the queue window.
 ## Added on `luma` (`1.3.1+ls.0.8.0`): live sync-queue visibility
 
 - **Tray "Show sync queue…" window** (`tray_queue_window.py`,
-  `SyncQueueWindow`, singleton on the addon): queued / in-progress (with %)
+  `SyncQueueWindow` — since superseded by `tray_control_window.py`'s
+  `SyncControlWindow`, see the control-panel section above): queued /
+  in-progress (with %)
   / failed / paused representations across enabled projects, direction
   inferred from which side still has work, "Retry all failed" via the
   `resetFailed` endpoint. Polls the addon's `/state` endpoint every 4s
