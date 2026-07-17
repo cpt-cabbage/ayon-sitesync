@@ -179,6 +179,17 @@ class SitesSubmodel(BaseSettingsModel):
 
 class LocalSubmodel(BaseSettingsModel):
     """Select your local and remote site"""
+    # Site sync is opt-in per artist site: without this toggle (or an
+    # explicit active/remote pair below) a machine behaves as a plain
+    # studio workstation - no syncing, no local roots, no prompts.
+    sync_enabled: bool = Field(
+        False,
+        title="Use site sync on this machine",
+        scope=["site"],
+        description="Work in a local folder and sync published files"
+                    " with the studio in the background. Off: files are"
+                    " used directly from the studio storage."
+    )
     active_site: str = Field("",
                              title="My Active Site",
                              scope=["site"],

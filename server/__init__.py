@@ -137,12 +137,17 @@ class SiteSync(BaseServerAddon):
             local_setting = settings.dict()["local_setting"]
             for site_type in ["active_site", "remote_site"]:
                 used_site = local_setting[site_type]
-                if not used_site and user.name in site_users:
+                if (
+                    not used_site
+                    and user.name in site_users
+                    and local_setting.get("sync_enabled")
+                ):
                     # Zero-touch default, mirroring the client: an
-                    # unconfigured machine of this user acts as active
-                    # 'local' syncing against 'studio'. Without this the
-                    # web page rendered blank until the artist manually
-                    # filled their site settings.
+                    # opted-in ('sync_enabled') machine of this user with
+                    # no explicit pair acts as active 'local' syncing
+                    # against 'studio'. Without this the web page rendered
+                    # blank until the artist manually filled their site
+                    # settings.
                     if site_type == "active_site":
                         used_site = "local"
                     else:

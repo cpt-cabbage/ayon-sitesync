@@ -29,10 +29,8 @@ from .version import __version__
 from .providers.local_drive import LocalDriveHandler
 from .machine_role import (
     ROLE_REMOTE,
-    get_saved_machine_role,
     get_default_local_root_base,
     get_machine_pref,
-    probe_machine_role,
     set_machine_pref,
 )
 
@@ -128,10 +126,9 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         self._pause_action = None
         self._control_window = None
 
-        # zero-touch machine role, resolved once per process per project -
-        # a role flip mid-session would change every resolved path
-        self._machine_role_by_project = {}
-        # studio roots fetched for the reachability probe / root names
+        # projects the zero-touch opt-in was already logged for
+        self._zero_touch_logged = set()
+        # studio roots fetched for synthesized root names
         self._studio_roots_cache = {}
         # local roots already warned about being cloud-synced
         self._cloud_root_warned = set()
@@ -783,8 +780,8 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         if active_site == remote_site:
             # Degenerate pair (the studio->studio default): with explicit
             # settings this configuration syncs nothing, ever. Zero-touch:
-            # a machine whose role is "remote" (tray prompt answer, or
-            # unreachable studio roots) works locally against studio.
+            # a site opted in via 'sync_enabled' works locally against
+            # studio.
             role = self._get_zero_touch_role(
                 project_name, sync_project_settings
             )
@@ -839,14 +836,18 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
     def _get_zero_touch_role(self, project_name, sync_project_settings):
         """Machine role for machines with no explicit site configuration.
 
-        Returns None whenever explicit configuration exists - the artist's
-        own 'local_setting' or a non-degenerate project 'config' pair -
-        so synthesis can never override a working setup; it only replaces
-        the guaranteed-noop default. Never raises: it runs on the publish
-        path (via 'get_active_site').
+        Site sync is opt-in per artist site: the site-scoped
+        'local_setting.sync_enabled' toggle (off by default) is what
+        makes an unconfigured machine act as a remote artist (active
+        'local', remote 'studio'). Returns None whenever explicit
+        configuration exists - the artist's own active/remote pair or a
+        non-degenerate project 'config' pair - so synthesis can never
+        override a working setup; it only replaces the guaranteed-noop
+        default. Never raises: it runs on the publish path (via
+        'get_active_site').
 
         Returns:
-            Union[str, None]: 'studio', 'remote' or None (no synthesis).
+            Union[str, None]: 'remote' or None (no synthesis).
         """
         try:
             local_setting = (
@@ -860,23 +861,17 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             config = sync_project_settings["config"]
             if config["active_site"] != config["remote_site"]:
                 return None
+            if not local_setting.get("sync_enabled"):
+                return None
 
-            if project_name in self._machine_role_by_project:
-                return self._machine_role_by_project[project_name]
-
-            role = get_saved_machine_role()
-            if role is None:
-                role = probe_machine_role(
-                    self._get_studio_roots(project_name)
-                )
-            self._machine_role_by_project[project_name] = role
-            if role == ROLE_REMOTE:
+            if project_name not in self._zero_touch_logged:
+                self._zero_touch_logged.add(project_name)
                 self.log.info(
-                    "Zero-touch site config: machine acts as remote"
-                    " artist for '{}' (active site 'local', remote"
-                    " 'studio')".format(project_name)
+                    "Site sync opted in for this site: machine acts as"
+                    " remote artist for '{}' (active site 'local',"
+                    " remote 'studio')".format(project_name)
                 )
-            return role
+            return ROLE_REMOTE
         except Exception:
             self.log.warning(
                 "Couldn't resolve zero-touch machine role", exc_info=True
@@ -1314,37 +1309,12 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         (eg. has valid credentials).
         """
         self.server_start()
-        self._schedule_machine_role_prompt()
         if self.enabled:
             # detect the invisible per-site 'enabled: false' override
             # without blocking tray startup on network calls
             threading.Thread(
                 target=self._run_doctor_checks, daemon=True
             ).start()
-
-    def _schedule_machine_role_prompt(self):
-        """Schedule the one-time 'studio or remote?' prompt.
-
-        Tray-only (needs Qt). Delayed so the tray finishes starting
-        first; never raises - the probe fallback covers an unanswered
-        prompt.
-        """
-        if not self.enabled:
-            return
-        try:
-            if get_saved_machine_role() is not None:
-                return
-
-            from qtpy import QtCore
-            from .tray_prompt import show_machine_role_prompt
-
-            QtCore.QTimer.singleShot(
-                3000, lambda: show_machine_role_prompt(self)
-            )
-        except Exception:
-            self.log.warning(
-                "Couldn't schedule machine role prompt", exc_info=True
-            )
 
     def server_start(self):
         if self.enabled:

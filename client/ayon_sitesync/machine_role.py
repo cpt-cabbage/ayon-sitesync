@@ -1,13 +1,13 @@
-"""Machine role resolution for zero-touch site configuration.
+"""Machine-local sitesync preferences and site-role helpers.
 
 A machine is either working "in the studio" (the share is its storage,
 nothing needs syncing for it) or "remote" (the artist works in a local
-folder and published files are synced in the background).
-
-The role is remembered per machine in the launcher's local data folder -
-written by the one-time tray prompt - with a reachability probe of the
-studio roots as fallback for machines that never answered the prompt
-(headless services, DCCs started before the tray).
+folder and published files are synced in the background). Which one it
+is comes from the server-side per-site opt-in
+('local_setting.sync_enabled', see 'addon._get_zero_touch_role') - this
+module only keeps the machine-local preference file (e.g. the tray's
+auto-download switch), the synthesized-local-root base and the
+studio-root reachability probe used by the work-area mirror.
 
 Must stay Python 3.7 compatible - imported in-process by DCCs.
 """
@@ -62,26 +62,6 @@ def set_machine_pref(key, value):
     content = _read_prefs()
     content[key] = value
     _write_prefs(content)
-
-
-def get_saved_machine_role():
-    """Role stored by the one-time tray prompt, or None if never answered.
-
-    Returns:
-        Union[str, None]: 'studio', 'remote' or None.
-    """
-    role = get_machine_pref("role")
-    if role in (ROLE_STUDIO, ROLE_REMOTE):
-        return role
-    return None
-
-
-def save_machine_role(role):
-    """Persist the machine role answered in the tray prompt."""
-    if role not in (ROLE_STUDIO, ROLE_REMOTE):
-        raise ValueError("Invalid machine role '{}'".format(role))
-    set_machine_pref("role", role)
-    log.info("Machine role saved as '{}'".format(role))
 
 
 def get_default_local_root_base():

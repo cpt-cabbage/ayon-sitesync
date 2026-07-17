@@ -211,6 +211,33 @@ roots (which stay in Site Settings):
   it "paused this session". Do NOT reintroduce the `update_db` call on an
   upstream sync.
 
+## Added on `luma` (unreleased, after `0.9.0`): site sync is opt-in per site
+
+Decision (2026-07-17): the studio/remote tray popup was judged noise, and
+site sync should never activate on a machine nobody opted in. A new
+site-scoped **`local_setting.sync_enabled`** toggle (default **off**,
+rendered on the Site Settings page above My Active Site) is now the ONLY
+zero-touch trigger — opting a site in *means* "this machine works
+remotely", so no role question is ever asked:
+
+- `_get_zero_touch_role` returns `remote` iff the resolved active/remote
+  pair is degenerate AND `sync_enabled` is true; otherwise `None` (machine
+  behaves as a plain studio workstation — no synthesis, no local roots, no
+  auto-download, no mirror). Explicit `local_setting` active/remote and a
+  non-degenerate project `config` pair still take precedence, unchanged.
+- **Deleted:** `tray_prompt.py` and its `tray_start` scheduling;
+  `get_saved_machine_role`/`save_machine_role` in `machine_role.py`. The
+  prefs file `sitesync_machine_role.json` **remains** (machine-local prefs,
+  e.g. the auto-download switch via `get_machine_pref`/`set_machine_pref`);
+  a stale `"role"` key from older builds is simply ignored.
+- `probe_machine_role` is kept ONLY as `workarea_mirror.py`'s
+  share-reachability check — it is no longer a role source anywhere.
+- Server `get_user_sites` mirrors the gate: the zero-touch local/studio
+  pair is synthesized only for the user's sites with `sync_enabled` true.
+- Rollout shape: project `enabled` stays true studio-wide; an admin (via
+  API/web) or the artist (Site Settings page) flips `sync_enabled` per
+  site. Machines never opted in stay silent — no popups, no probes.
+
 ## Added on `luma` (`1.3.1+ls.0.9.0`): work-area workfile mirror + log fixes
 
 **Why a mirror and not the sitesync DB** (asked and answered - keep this
@@ -354,12 +381,10 @@ machines):
 
 - **Machine role** (`machine_role.py`): `studio` or `remote`. Precedence:
   artist's explicit `local_setting` (always wins, never synthesized over) →
-  non-degenerate project `config` pair (admin force) → role file
-  `<launcher_local_dir>/sitesync_machine_role.json` written by a **one-time
-  tray prompt** (`tray_prompt.py`, scheduled from `tray_start`) → reachability
-  probe of the project's studio roots (threaded `os.path.isdir` with timeout —
-  dead UNC paths hang). Probe/prompt results are cached **per process** — a
-  role flip mid-session would change every resolved path.
+  non-degenerate project `config` pair (admin force) → **[superseded]** role
+  file written by a one-time tray prompt → reachability probe. The prompt +
+  role-file + probe steps were replaced by the per-site `sync_enabled`
+  opt-in (see the unreleased opt-in section above).
 - **Synthesis fires ONLY when the resolved active/remote pair is degenerate**
   (equal — today's guaranteed silent no-op, studio→studio default), so it can
   never regress a working configuration. Implemented in
@@ -383,8 +408,9 @@ machines):
 **Rules:**
 - Never write `local_setting` (or anything) to per-site server overrides with
   a whole-object PUT — that is how the invisible `enabled:false` trap is
-  minted. The prompt deliberately writes NOTHING to the server; the role file
-  + synthesis is the whole mechanism.
+  minted. The client deliberately writes NOTHING to the server; artists flip
+  `sync_enabled` themselves on the Site Settings page (or an admin does via
+  the API with `x-as-user`).
 - Synthesis must stay behind the `enabled` checks and behind the
   degenerate-pair check.
 - `get_active_site_type` and `get_remote_site` must stay consistent - if one
