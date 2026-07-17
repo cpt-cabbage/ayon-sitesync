@@ -166,6 +166,51 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (`1.3.1+ls.0.2.0`): zero-touch site configuration
+
+Artists no longer hand-edit site settings. Design (all client-side synthesis —
+server-side *defaults* were deliberately NOT pointed at `local`, because
+site-scoped defaults cannot distinguish studio workstations from remote
+machines):
+
+- **Machine role** (`machine_role.py`): `studio` or `remote`. Precedence:
+  artist's explicit `local_setting` (always wins, never synthesized over) →
+  non-degenerate project `config` pair (admin force) → role file
+  `<launcher_local_dir>/sitesync_machine_role.json` written by a **one-time
+  tray prompt** (`tray_prompt.py`, scheduled from `tray_start`) → reachability
+  probe of the project's studio roots (threaded `os.path.isdir` with timeout —
+  dead UNC paths hang). Probe/prompt results are cached **per process** — a
+  role flip mid-session would change every resolved path.
+- **Synthesis fires ONLY when the resolved active/remote pair is degenerate**
+  (equal — today's guaranteed silent no-op, studio→studio default), so it can
+  never regress a working configuration. Implemented in
+  `get_active_site_type` + `get_remote_site` via `_get_zero_touch_role`
+  (never raises — publish path).
+- **Local roots**: `get_local_roots_with_defaults` is the single source for
+  every consumer (Anatomy via `get_site_root_overrides`, dirmap, sync loop via
+  `_get_default_site_configs` — do NOT read `local_setting["local_roots"]`
+  directly anywhere else). Empty roots + remote role ⇒ synthesized
+  `~/AYON_local/<root_name>` (`get_default_local_root_base`, cloud-synced-path
+  vetoed via `utils.is_cloud_synced_path`; artist-configured cloud roots get a
+  deduplicated warning).
+- **Server**: `local_roots` server default changed from the
+  `C:/projects_local` placeholder to **empty** (explicit artist values are
+  overrides and unaffected — but a merge restoring `default_roots` would
+  disable synthesis for everyone, since roots would never be "unset").
+  `get_user_sites` mirrors the zero-touch defaults for the user's own
+  machines (filtered by `sites.data["users"]`) so the web page renders for
+  unconfigured artists instead of returning empty lists.
+
+**Rules:**
+- Never write `local_setting` (or anything) to per-site server overrides with
+  a whole-object PUT — that is how the invisible `enabled:false` trap is
+  minted. The prompt deliberately writes NOTHING to the server; the role file
+  + synthesis is the whole mechanism.
+- Synthesis must stay behind the `enabled` checks and behind the
+  degenerate-pair check.
+- `get_active_site_type` and `get_remote_site` must stay consistent - if one
+  synthesizes, both must.
+
 ## Fixed on `luma` (`1.3.1+ls.0.1.0`): failure isolation & silent-trap fixes
 
 All still present upstream — a merge can reintroduce any of them.
