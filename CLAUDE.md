@@ -166,6 +166,26 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (`1.3.1+ls.0.4.0`): tray menu, notifications, doctor
+
+The tray finally has a face (`tray_menu` was `pass`):
+
+- **Site Sync submenu**: *Sync now* (`reset_timer`), *Pause syncing*
+  (checkable; wires the dormant `pause_server`/`unpause_server` — enabled by a
+  `sync_loop` fix: the pause check moved INSIDE the loop; previously
+  `while ... and not is_paused()` meant pausing ended the coroutine
+  permanently and resume never worked. Do not move it back), *Adopt existing
+  local files* (revived `validate_project`, scheduled through
+  `long_running_tasks` via `_safe_validate_project` — scheduled funcs must
+  never raise or they kill `check_shutdown`), *Open sync status page*.
+- **Failure notifications**: `update_db` → `_notify_failed_transfer` shows a
+  tray bubble when a transfer flips to FAILED, throttled to one per project
+  per 5 min, marshalled via `execute_in_main_thread`, no-op outside the tray.
+- **Doctor** (`_run_doctor_checks`, worker thread at `tray_start`): detects
+  the invisible per-site `enabled:false` override (see Deployment Trap below)
+  by comparing `get_addon_project_settings(use_site=False)` vs `use_site=True`
+  per project, and names the fix in a tray bubble + warning log.
+
 ## Added on `luma` (`1.3.1+ls.0.3.0`): auto-download of assigned work
 
 `auto_download.py` (`AutoDownloader`, owned by `SiteSyncThread`, called at the
