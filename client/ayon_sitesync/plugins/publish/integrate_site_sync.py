@@ -43,11 +43,15 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
         for repre_id, inst in published_representations.items():
             for site_info in published_sites:
                 try:
+                    # follow_links=False everywhere in this plugin: a
+                    # publish must only record its OWN representations,
+                    # never queue transfers of what they link to
                     sitesync_addon.add_site(
                         project_name,
                         repre_id,
                         site_info["name"],
-                        status=site_info["status"]
+                        status=site_info["status"],
+                        follow_links=False,
                     )
                 except SiteAlreadyPresentError:
                     # Publishing into an EXISTING version keeps repre ids
@@ -70,6 +74,7 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
                         site_info["name"],
                         status=site_info["status"],
                         force=True,
+                        follow_links=False,
                     )
 
         hero_version_entity = instance.data.get("heroVersionEntity")
@@ -121,6 +126,7 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
                         hero_repre["id"],
                         site_name,
                         status=site_status,
+                        follow_links=False,
                     )
             else:
                 # update existing synced
@@ -136,4 +142,5 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
                         repre_on_site["siteName"],
                         status=site_status,
                         force=True,
+                        follow_links=False,
                     )

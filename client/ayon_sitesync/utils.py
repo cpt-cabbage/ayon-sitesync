@@ -177,11 +177,29 @@ def get_last_published_workfile_representation(
     return None
 
 
+# Fallback for the 'auto_download_link_depth' server setting. Shared by
+# auto-download and the manual-transfer link follower so both paths
+# always resolve the same depth.
+DEFAULT_LINK_DEPTH = 2
+
+
+def get_link_depth(config):
+    """Resolve 'auto_download_link_depth' from a config dict, clamped >= 1."""
+    try:
+        depth = int(
+            config.get("auto_download_link_depth") or DEFAULT_LINK_DEPTH
+        )
+    except (TypeError, ValueError):
+        depth = DEFAULT_LINK_DEPTH
+    return max(depth, 1)
+
+
 def get_linked_representation_id(
     project_name,
     repre_entity,
     link_type,
-    max_depth=None
+    max_depth=None,
+    link_direction="in"
 ):
     """Returns list of linked ids of particular type (if provided).
 
@@ -198,8 +216,12 @@ def get_linked_representation_id(
     Args:
         project_name (str): Name of project where look for links.
         repre_entity (dict[str, Any]): Representation entity.
-        link_type (str): Type of link (e.g. 'reference', ...).
+        link_type (Union[str, Iterable[str]]): Type(s) of link
+            (e.g. 'reference', 'generative', ...).
         max_depth (int): Limit recursion level. Default: 0
+        link_direction (str): 'in' follows the version's inputs (what it
+            was made from / loaded), 'out' follows its outputs (what was
+            made from it, e.g. renders of a workfile).
 
     Returns:
         List[ObjectId] Linked representation ids.
@@ -214,7 +236,10 @@ def get_linked_representation_id(
 
     link_types = None
     if link_type:
-        link_types = [link_type]
+        if isinstance(link_type, (list, tuple, set)):
+            link_types = list(link_type)
+        else:
+            link_types = [link_type]
 
     # Store already found version ids to avoid recursion, and also to store
     #   output -> Don't forget to remove 'version_id' at the end!!!
@@ -229,7 +254,7 @@ def get_linked_representation_id(
             project_name,
             versions_to_check,
             link_types=link_types,
-            link_direction="in")  # looking for 'in'puts for version
+            link_direction=link_direction)
 
         versions_to_check = set()
         for links in versions_links.values():

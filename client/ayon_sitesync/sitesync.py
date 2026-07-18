@@ -305,7 +305,11 @@ def download_last_published_workfile(
                 repre_id,
                 local_site_id,
                 force=True,
-                # priority=99  TODO add when implemented
+                # the artist is blocked in a launch dialog waiting for
+                # this download - jump the queue
+                priority=99,
+                # reference links were already followed above
+                follow_links=False,
             )
     sitesync_addon.reset_timer()
     print("Starting to download:{}".format(last_published_workfile_path))
@@ -336,6 +340,9 @@ class SiteSyncThread(threading.Thread):
         self.timer = None
         self._warned_keys = set()
         self.auto_downloader = AutoDownloader(addon)
+        # projects whose zero-record representations were already
+        # backfilled this tray session
+        self._backfilled_projects = set()
 
     def run(self):
         self.is_running = True
@@ -389,6 +396,24 @@ class SiteSyncThread(threading.Thread):
                     # in its constructor, transient DB error) must not stop
                     # syncing for every other project - contain it here.
                     try:
+                        # Heal representations that have NO site records
+                        # (created by Push-to-project, editorial ingest, or
+                        # a publish without sitesync) - an NA/NA pair is
+                        # invisible to this loop forever otherwise. Once
+                        # per project per tray session, only on machines
+                        # whose pair actually syncs, and off the event
+                        # loop (a large first-time backfill must not block
+                        # 'check_shutdown'/'reset_timer' handling).
+                        if project_name not in self._backfilled_projects:
+                            self._backfilled_projects.add(project_name)
+                            active = self.addon.get_active_site(project_name)
+                            remote = self.addon.get_remote_site(project_name)
+                            if active != remote:
+                                await self.loop.run_in_executor(
+                                    None,
+                                    self._backfill_site_records,
+                                    project_name,
+                                )
                         # Queue missing assigned-task work first (throttled
                         # internally, never raises) so this very loop pass
                         # picks the new downloads up.
@@ -435,6 +460,28 @@ class SiteSyncThread(threading.Thread):
                 # ran (e.g. fetching settings), so wait here to avoid
                 # hammering an unreachable server in a hot loop.
                 await asyncio.sleep(30)
+
+    def _backfill_site_records(self, project_name):
+        """Best-effort server-side backfill of zero-record representations.
+
+        Contained like everything else in the per-project loop body - a
+        failure (old server without the endpoint, transient error) only
+        logs and the next tray session retries.
+        """
+        try:
+            count = self.addon.backfill_missing_site_records(project_name)
+            if count:
+                self.log.info(
+                    "Backfilled {} representation(s) without site records"
+                    " in '{}' (stamped as available on the remote"
+                    " site)".format(count, project_name)
+                )
+        except Exception:
+            self.log.warning(
+                "Couldn't backfill missing site records for '{}'".format(
+                    project_name),
+                exc_info=True
+            )
 
     def stop(self):
         """Sets is_running flag to false, 'check_shutdown' shuts server down"""

@@ -40,6 +40,8 @@ from .utils import (
     SiteAlreadyPresentError,
     SiteSyncStatus,
     is_cloud_synced_path,
+    get_link_depth,
+    get_linked_representation_id,
 )
 
 SYNC_ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +128,15 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         self._pause_action = None
         self._control_window = None
 
+        # (project, site, repre_id) -> timestamp of representations just
+        # queued/considered as link dependencies; lets add_site skip
+        # re-following links when core's own workfile link loop re-adds
+        # each of them moments later
+        self._recent_link_follows = {}
+        # set False after the server rejects sortBy=priority (422) once,
+        # so a pre-priority server doesn't cost a doomed request per fetch
+        self._priority_sort_supported = True
+
         # projects the zero-touch opt-in was already logged for
         self._zero_touch_logged = set()
         # studio roots fetched for synthesized root names
@@ -199,7 +210,9 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         site_name=None,
         file_id=None,
         force=False,
-        status=SiteSyncStatus.QUEUED
+        status=SiteSyncStatus.QUEUED,
+        priority=None,
+        follow_links=None
     ):
         """Adds new site to representation to be synced.
 
@@ -218,6 +231,21 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             force (bool): Reset site if exists.
             status (SiteSyncStatus): Current status,
                 default SiteSyncStatus.QUEUED
+            priority (int): 0-100, higher transfers first. None keeps the
+                stored/default priority.
+            follow_links (bool): Also queue representations linked to this
+                one ('reference'/'generative' version links, followed to
+                the configured depth). Default None resolves to True for
+                QUEUED requests - which makes EXTERNAL callers (core's
+                Loader / Scene Inventory download+upload, which cannot
+                pass this argument) pull dependencies, closing the USD
+                gap upstream marked TODO in core's loader sitesync model.
+                Sitesync-internal callers pass it EXPLICITLY: False
+                everywhere (the publish integrator must not amplify a
+                publish; the launch hook / auto-download follow links
+                themselves) except the control panel's manual
+                download/upload row action, which passes True - same
+                semantics as a Loader transfer.
 
         Raises:
             SiteAlreadyPresentError: If adding already existing site and
@@ -225,11 +253,54 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             ValueError: other errors (repre not found, misconfiguration)
 
         """
-        if not self.get_sync_project_setting(project_name):
-            raise ValueError("Project not configured")
-
         if not site_name:
             site_name = self.DEFAULT_SITE
+
+        representation = self._add_site_record(
+            project_name, representation_id, site_name,
+            file_id, force, status, priority
+        )
+
+        if follow_links is None:
+            follow_links = status == SiteSyncStatus.QUEUED
+        if (
+            representation is not None
+            and follow_links
+            # if this repre was itself just queued as someone else's
+            # dependency, its own links were already covered by that
+            # deeper traversal - avoids re-traversing per repre when
+            # core's workfile link loop re-adds each dependency
+            and not self._was_recently_linked(
+                project_name, site_name, representation_id
+            )
+        ):
+            self._add_linked_site_records(
+                project_name, representation, site_name
+            )
+
+        # Wake the sync loop now instead of waiting out `loop_delay` (60s by
+        # default). Previously only the launch hook did this, so anything a
+        # user actually waits on - Loader/Manager "Download"/"Upload", and the
+        # upload after a publish - sat idle for up to a minute before the
+        # transfer even started. `reset_timer` works cross-process: from a DCC
+        # it POSTs to the tray's webserver. It is best-effort and never raises.
+        self.reset_timer()
+
+    def _add_site_record(
+        self, project_name, representation_id, site_name,
+        file_id, force, status, priority
+    ):
+        """Create/reset a single site record - the core of 'add_site'.
+
+        No link-following and no timer reset, so the link follower can
+        add many records with one wake-up at the end.
+
+        Returns:
+            Union[dict, None]: The representation entity, or None when it
+                has no files (nothing was written).
+        """
+        if not self.get_sync_project_setting(project_name):
+            raise ValueError("Project not configured")
 
         representation = get_representation_by_id(
             project_name, representation_id
@@ -238,7 +309,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         files = representation.get("files", [])
         if not files:
             self.log.debug("No files for {}".format(representation_id))
-            return
+            return None
 
         if not force:
             existing = self.get_repre_sync_state(
@@ -270,19 +341,137 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         ]
 
         payload_dict = {"files": new_site_files}
+        if priority is not None:
+            payload_dict["priority"] = int(priority)
         representation_id = representation_id.replace("-", "")
 
         self._set_state_sync_state(
             project_name, representation_id, site_name, payload_dict, force
         )
+        return representation
 
-        # Wake the sync loop now instead of waiting out `loop_delay` (60s by
-        # default). Previously only the launch hook did this, so anything a
-        # user actually waits on - Loader/Manager "Download"/"Upload", and the
-        # upload after a publish - sat idle for up to a minute before the
-        # transfer even started. `reset_timer` works cross-process: from a DCC
-        # it POSTs to the tray's webserver. It is best-effort and never raises.
-        self.reset_timer()
+    # seconds a repre id stays in '_recent_link_follows' - long enough to
+    # cover core's follow-up add_site calls for the same user action
+    _LINK_FOLLOW_TTL = 60
+
+    def _was_recently_linked(self, project_name, site_name, repre_id):
+        key = (project_name, site_name, str(repre_id).replace("-", ""))
+        stamp = self._recent_link_follows.get(key)
+        return stamp is not None and time.time() - stamp < self._LINK_FOLLOW_TTL
+
+    def _remember_linked(self, project_name, site_name, repre_ids):
+        now = time.time()
+        cache = self._recent_link_follows
+        if len(cache) > 2000:
+            cutoff = now - self._LINK_FOLLOW_TTL
+            for key in list(cache):
+                if cache[key] < cutoff:
+                    del cache[key]
+        for repre_id in repre_ids:
+            key = (project_name, site_name, str(repre_id).replace("-", ""))
+            cache[key] = now
+
+    def _add_linked_site_records(
+        self, project_name, representation, site_name
+    ):
+        """Queue representations version-linked to 'representation' too.
+
+        Manual Loader/Scene Inventory transfers used to move exactly one
+        representation (core follows links for workfile products only, with
+        its own "TODO this should happen in site sync addon" comment) - a
+        USD assembly or look arrived without its layers/textures. Follows
+        'reference' (loaded content) AND 'generative' (what the version
+        was made from) inputs to 'auto_download_link_depth'.
+
+        Safety rules (both learned the hard way elsewhere in this addon):
+        - A linked repre is queued ONLY when the target site has no
+          record at all AND the opposite side of the pair is fully OK.
+          Anything else would either mint a QUEUED/NA pair the sync loop
+          can never match (the documented invisible-forever trap) or
+          reset a record that is already queued/transferring/failed.
+        - Additions use force=False and swallow SiteAlreadyPresentError,
+          so concurrent callers cannot wipe each other's progress.
+
+        The pair state of all candidates is fetched in ONE batched
+        /state call - no per-link REST chatter. Best-effort by design:
+        a link-following failure must never fail the primary transfer.
+        Linked additions go through '_add_site_record' directly, so
+        there is no recursion and no per-link timer reset.
+        """
+        try:
+            settings = self.get_sync_project_setting(project_name) or {}
+            config = settings.get("config") or {}
+            if not config.get("manual_transfer_dependencies", True):
+                return
+
+            active_site = self.get_active_site(project_name)
+            remote_site = self.get_remote_site(project_name)
+            if (
+                active_site == remote_site
+                or site_name not in (active_site, remote_site)
+            ):
+                # degenerate pair, or an alternate site outside the pair -
+                # there is no opposite side to check sources against
+                return
+
+            linked_ids = get_linked_representation_id(
+                project_name,
+                representation,
+                ["reference", "generative"],
+                max_depth=get_link_depth(config)
+            )
+            linked_ids = [
+                link_repre_id
+                for link_repre_id in linked_ids
+                if not self._was_recently_linked(
+                    project_name, site_name, link_repre_id
+                )
+            ]
+            if not linked_ids:
+                return
+            self._remember_linked(project_name, site_name, linked_ids)
+
+            if site_name == active_site:
+                target_key, source_key = "localStatus", "remoteStatus"
+            else:
+                target_key, source_key = "remoteStatus", "localStatus"
+
+            states = self._get_repres_state(
+                project_name, linked_ids, active_site, remote_site
+            )
+            for state in states:
+                link_repre_id = state["representationId"]
+                if state[target_key]["status"] != SiteSyncStatus.NA:
+                    # already tracked on the target site (queued, moving,
+                    # failed, paused or done) - never reset it from here
+                    continue
+                if state[source_key]["status"] != SiteSyncStatus.OK:
+                    # source side incomplete - queueing would create a
+                    # QUEUED/NA pair the sync loop never matches
+                    continue
+                try:
+                    self.log.debug(
+                        "Adding linked representation {} to site {}".format(
+                            link_repre_id, site_name)
+                    )
+                    self._add_site_record(
+                        project_name, link_repre_id, site_name,
+                        None, False, SiteSyncStatus.QUEUED, None
+                    )
+                except SiteAlreadyPresentError:
+                    pass
+                except Exception:
+                    self.log.warning(
+                        "Couldn't add linked representation '{}' to site"
+                        " '{}'".format(link_repre_id, site_name),
+                        exc_info=True
+                    )
+        except Exception:
+            self.log.warning(
+                "Couldn't resolve linked representations of '{}'".format(
+                    representation.get("id")),
+                exc_info=True
+            )
 
     def remove_site(
         self,
@@ -330,6 +519,100 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
         if remove_local_files:
             self._remove_local_file(project_name, representation_id, site_name)
+
+    def set_representation_priority(
+        self, project_name, representation_id, priority
+    ):
+        """Store transfer priority on every site record of a representation.
+
+        Higher priority transfers first (default 50, range 0-100). One
+        server call updates ALL existing rows of the representation in a
+        single statement, so the two sides of a pair can never diverge
+        (the /state roll-up reads the highest of them). Rows are only
+        updated, never created - a side without a record stays absent.
+        """
+        priority = max(0, min(100, int(priority)))
+        # query params must live in the URL: ayon_api.post sends kwargs
+        # as the JSON body
+        endpoint = "{}/{}/state/setPriority/{}?priority={}".format(
+            self.endpoint_prefix,
+            project_name,
+            str(representation_id).replace("-", ""),
+            priority
+        )
+        response = ayon_api.post(endpoint)
+        if response.status_code not in [200, 204]:
+            raise RuntimeError(
+                "Cannot set priority on {} ({})".format(
+                    representation_id, response.status_code
+                )
+            )
+        self.reset_timer()
+
+    def download_my_renders(self):
+        """One-shot pull of the latest render outputs of the user's tasks.
+
+        Follows 'generative' OUTPUT links of the last published workfile
+        version of every assigned/recently-opened task and queues the
+        resulting representations (renders and other products generated
+        FROM the workfile) for download to this machine. Explicit artist
+        request - the sync control panel button - so the auto-download
+        ledger and on/off switches are ignored; pause and free-space
+        limits still apply.
+
+        Returns:
+            int: Number of newly queued representations.
+        """
+        # reuse the sync thread's downloader when it exists so
+        # session-scoped state (warn-once dedup, username cache) is
+        # shared with the periodic loop; fall back to a fresh instance
+        thread = self.sitesync_thread
+        downloader = getattr(thread, "auto_downloader", None)
+        if downloader is None:
+            from .auto_download import AutoDownloader
+
+            downloader = AutoDownloader(self)
+        return downloader.download_renders()
+
+    def backfill_missing_site_records(self, project_name, site_name=None):
+        """Stamp available-on-source on repres with no site records at all.
+
+        Representations created outside the normal publish (core's
+        Push-to-project, editorial ingest, a publish with sitesync
+        disabled/crashed) have zero rows and are invisible to the sync
+        loop forever. Called once per project per tray session from the
+        sync thread; idempotent (and additionally throttled server-side,
+        since every participating tray triggers it).
+
+        The record is stamped on the project's resolved REMOTE site (the
+        transfer source the sync loop matches against). Stamping a site
+        outside the active/remote pair would not make the representation
+        syncable AND would permanently consume its zero-record state -
+        the endpoint only ever touches repres with no rows at all.
+
+        Returns:
+            int: Number of representations backfilled.
+        """
+        from urllib.parse import quote
+
+        if not site_name:
+            site_name = (
+                self.get_remote_site(project_name) or self.DEFAULT_SITE
+            )
+        # query params must live in the URL: ayon_api.post sends kwargs
+        # as the JSON body
+        endpoint = "{}/{}/state/backfill?siteName={}".format(
+            self.endpoint_prefix, project_name, quote(str(site_name))
+        )
+        response = ayon_api.post(endpoint)
+        if response.status_code not in [200, 204]:
+            raise RuntimeError(
+                "Backfill of site records failed for '{}' with {}".format(
+                    project_name, response.status_code
+                )
+            )
+        data = response.data or {}
+        return int(data.get("backfilledCount") or 0)
 
     def compute_resource_sync_sites(self, project_name):
         """Get available resource sync sites state for publish process.
@@ -2047,8 +2330,29 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             "remoteStatusFilter": [SiteSyncStatus.QUEUED],
             "pageLength": max(int(limit or 0), 1),
         }
+        if self._priority_sort_supported:
+            # highest stored priority first, so "sync this first"
+            # requests (and the launch hook's priority=99 workfile
+            # download) actually enter the batch before the backlog
+            kwargs["sortBy"] = "priority"
+            kwargs["sortDesc"] = True
 
         response = ayon_api.get(endpoint, **kwargs)
+        if response.status_code == 422 and "sortBy" in kwargs:
+            # A server without 'priority' in SortByEnum rejects the value
+            # with a validation error - fetch unsorted rather than not at
+            # all (mixed client/server versions mid-rollout). Remember the
+            # downgrade so every subsequent fetch doesn't pay a doomed
+            # request first.
+            self._priority_sort_supported = False
+            self.log.warning(
+                "Server rejected 'sortBy=priority' - transfer priority is"
+                " inert until the sitesync server addon is updated;"
+                " fetching unsorted for the rest of this session."
+            )
+            kwargs.pop("sortBy", None)
+            kwargs.pop("sortDesc", None)
+            response = ayon_api.get(endpoint, **kwargs)
         if response.status_code not in [200, 204]:
             raise RuntimeError(
                 "Cannot get representations for sync with code {}".format(
@@ -2296,7 +2600,8 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 site_name = self.get_remote_site(project_name)
 
         self.add_site(
-            project_name, representation_id, site_name, file_id, force=True
+            project_name, representation_id, site_name, file_id,
+            force=True, follow_links=False
         )
 
     def _get_progress_for_repre_new(

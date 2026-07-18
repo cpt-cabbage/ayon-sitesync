@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+import time
 from typing import Any, Type
 from nxtools import logging
 import os
@@ -67,6 +68,21 @@ class SiteSync(BaseServerAddon):
         self.add_endpoint(
             "/{project_name}/state/resetFailed",
             self.reset_failed_representations,
+            method="POST",
+        )
+
+        self.add_endpoint(
+            "/{project_name}/state/backfill",
+            self.backfill_missing_site_records,
+            method="POST",
+        )
+
+        # NOTE: registered before the generic
+        # '/{project_name}/state/{representation_id}/{site_name}' POST so
+        # the literal 'setPriority' segment wins route matching
+        self.add_endpoint(
+            "/{project_name}/state/setPriority/{representation_id}",
+            self.set_representation_priority,
             method="POST",
         )
 
@@ -345,7 +361,11 @@ class SiteSync(BaseServerAddon):
                 remote.data as remote_data,
                 local.status as localStatus,
                 remote.status as remoteStatus,
-                v.id as version_id
+                v.id as version_id,
+                GREATEST(
+                    COALESCE(local.priority, 50),
+                    COALESCE(remote.priority, 50)
+                ) as priority
             FROM
                 project_{project_name}.folders as f
             INNER JOIN
@@ -463,7 +483,8 @@ class SiteSync(BaseServerAddon):
                     localStatus=local_status,
                     remoteStatus=remote_status,
                     files=file_list,
-                    version_id=row["version_id"]
+                    version_id=row["version_id"],
+                    priority=row["priority"],
                 )
             )
 
@@ -560,6 +581,123 @@ class SiteSync(BaseServerAddon):
                     reset_count += 1
 
         return {"resetCount": reset_count}
+
+    async def backfill_missing_site_records(
+        self,
+        project_name: ProjectName,
+        user: CurrentUser,
+        site_name: str = Query(
+            "studio",
+            alias="siteName",
+            description="Site stamped onto representations without any"
+                        " sync record",
+        ),
+    ) -> dict[str, int]:
+        """Create a site record for representations that have none at all.
+
+        Representations created outside the normal publish flow (core's
+        Push-to-project, editorial ingest, a publish run with the sitesync
+        addon disabled or crashed) end up with ZERO rows in
+        'sitesync_files_status'. An NA/NA pair is invisible to the sync
+        loop forever and nothing else ever heals it. This stamps such
+        representations as fully available on 'siteName' - clients pass
+        the project's resolved remote site (the transfer source the sync
+        loop matches against); 'studio' is only the fallback default.
+        Idempotent: representations with ANY existing record are left
+        untouched, so repeated calls are no-ops (and throttled).
+        """
+        await check_sync_status_table(project_name)
+        validate_site_name(site_name)
+
+        # Every participating tray triggers this once per session, so
+        # throttle server-side: in the steady state the anti-join scan
+        # proves "nothing to do" only by scanning, which is not free on
+        # large projects.
+        throttle_key = (project_name, site_name)
+        now = time.time()
+        if now - _backfill_last_run.get(throttle_key, 0) < _BACKFILL_THROTTLE:
+            return {"backfilledCount": 0}
+        _backfill_last_run[throttle_key] = now
+
+        # One set-based statement: no per-row round-trips, no long-held
+        # transaction, files JSON built in SQL. ON CONFLICT guards a
+        # concurrent publish/add_site creating a row mid-statement.
+        query = f"""
+            INSERT INTO project_{project_name}.sitesync_files_status
+                (representation_id, site_name, status, priority, data)
+            SELECT
+                r.id,
+                $1,
+                $2,
+                50,
+                jsonb_build_object('files', (
+                    SELECT jsonb_object_agg(
+                        f->>'id',
+                        jsonb_build_object(
+                            'hash', f->'hash',
+                            'status', $2::integer,
+                            'size', COALESCE((f->>'size')::bigint, 0),
+                            'timestamp', $3::bigint
+                        )
+                    )
+                    FROM jsonb_array_elements(r.files) AS f
+                ))
+            FROM project_{project_name}.representations AS r
+            INNER JOIN project_{project_name}.versions AS v
+                ON r.version_id = v.id
+            INNER JOIN project_{project_name}.products AS p
+                ON v.product_id = p.id
+            WHERE r.active IS TRUE
+              AND v.active IS TRUE
+              AND p.active IS TRUE
+              AND jsonb_array_length(r.files) > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM project_{project_name}.sitesync_files_status AS s
+                  WHERE s.representation_id = r.id
+              )
+            ON CONFLICT DO NOTHING
+        """
+
+        status_tag = await Postgres.execute(
+            query, site_name, int(StatusEnum.SYNCED), int(now)
+        )
+        # command tag looks like 'INSERT 0 <count>'; the count is
+        # informational only, so parsing failures just report 0
+        backfilled = 0
+        try:
+            backfilled = int(str(status_tag).rsplit(" ", 1)[-1])
+        except (ValueError, IndexError):
+            pass
+
+        return {"backfilledCount": backfilled}
+
+    async def set_representation_priority(
+        self,
+        project_name: ProjectName,
+        user: CurrentUser,
+        representation_id: RepresentationID,
+        priority: int = Query(..., ge=0, le=100),
+    ) -> Response:
+        """Set transfer priority on every site record of a representation.
+
+        One UPDATE across all of the representation's rows, so the two
+        sides of a sync pair can never diverge (the /state roll-up reads
+        the highest of them). Never creates a row - a POST to the
+        per-site state endpoint with an absent record would insert a
+        spurious NOT_AVAILABLE row; this endpoint deliberately cannot.
+        """
+        await check_sync_status_table(project_name)
+        await Postgres.execute(
+            f"""
+            UPDATE project_{project_name}.sitesync_files_status
+            SET priority = $1
+            WHERE representation_id = $2
+            """,
+            priority,
+            representation_id,
+        )
+        return Response(status_code=204)
 
     async def set_site_sync_representation_state(
         self,
@@ -807,6 +945,12 @@ def get_overal_status(files: dict) -> StatusEnum:
 # without this every state poll (the tray polls every few seconds) would
 # run three DDL statements per request.
 _ensured_status_tables: set[str] = set()
+
+# Last backfill run per (project, site) in this server process - every
+# participating tray triggers the endpoint once per session, and proving
+# "nothing to backfill" still costs a full anti-join scan.
+_backfill_last_run: dict[tuple[str, str], float] = {}
+_BACKFILL_THROTTLE = 3600  # seconds
 
 
 async def check_sync_status_table(project_name: str) -> None:

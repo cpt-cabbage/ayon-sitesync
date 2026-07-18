@@ -166,6 +166,115 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (unreleased, 2026-07-18): deferred-audit items A/C/D/E/G
+
+Implements five of the seven items deferred from the 2026-07-17 full
+audit **without touching ayon-core** — only B (live-% poll timer in
+core's Manager/Loader) and F (published-tab UX) remain deferred, both
+being core-fork UI edits. No version bump (user bumps explicitly).
+Mixed-rollout tolerant: the loop's `sortBy=priority` falls back to an
+unsorted fetch on a 422 from a pre-priority server, and a missing
+backfill endpoint only logs a contained warning. All new artist-facing
+controls live in the **sync control panel**, never the tray menu
+(user decision 2026-07-18).
+
+- **(A) Manual transfers pull dependencies.** The audit filed this as a
+  core change, but core's Loader/Scene Inventory call the addon's
+  `add_site` UNCONDITIONALLY *before* core's workfile-only link loop
+  (upstream's own "TODO this should happen in site sync addon"), so the
+  addon can follow links itself. `add_site` grew `follow_links`
+  (default `None` = follow for QUEUED requests, which is what external
+  callers send): `_add_linked_site_records` follows `reference` +
+  `generative` version links to `auto_download_link_depth`,
+  best-effort (never fails the primary transfer), no recursion (linked
+  adds go through `_add_site_record`, the record-writing core of
+  `add_site` with no follow/timer-reset of its own).
+  **Safety rules — do not weaken them:**
+  - a linked repre is queued ONLY when the target site has NO record
+    AND the opposite side of the pair is fully OK. Anything else would
+    mint a QUEUED/NA pair the sync loop can never match (the
+    documented invisible-forever trap) or force-reset a record already
+    queued/transferring/deliberately-FAILED;
+  - pair state of all candidates comes from ONE batched
+    `_get_repres_state` call (no per-link REST), additions use
+    `force=False` + swallowed `SiteAlreadyPresentError`;
+  - a 60s in-memory cache (`_recent_link_follows`) stops re-traversal
+    when core's own workfile link loop re-adds each dependency;
+  - alternate sites outside the active/remote pair are never followed.
+  **Invariant: every sitesync-internal `add_site` caller passes
+  `follow_links` EXPLICITLY** — `False` everywhere (the publish
+  integrator must not amplify a publish; launch hook / auto-download
+  follow links themselves) except the control panel's per-row manual
+  download/upload, which passes `True` (same semantics as a Loader
+  transfer). Kill switch: `config.manual_transfer_dependencies`
+  (default on). NOTE: only pulls anything if the publish plugins
+  actually wrote version links — check a production USD publish
+  (`GET /versions/{id}/links`) before debugging "it pulled nothing".
+- **(D) Priority is wired end-to-end.** `SortByEnum.priority` + a
+  `GREATEST(COALESCE(local.priority,50), COALESCE(remote.priority,50))
+  AS priority` select alias; `/state` rows now return `priority`; the
+  sync loop fetches `sortBy=priority&sortDesc=true`, so higher priority
+  genuinely transfers first (on a pre-priority server the 422 is
+  remembered — `_priority_sort_supported` — and the loop fetches
+  unsorted with ONE warning instead of a doomed request per pass).
+  `add_site` accepts `priority` and the launch hook's blocking workfile
+  download now posts `priority=99` (upstream's own `# priority=99 TODO
+  add when implemented`). Writing goes through a dedicated endpoint
+  `POST /{project}/state/setPriority/{repre}?priority=N` (registered
+  BEFORE the generic `state/{repre}/{site}` route so the literal
+  segment wins): one UPDATE across ALL of the repre's rows, so the two
+  sides can never diverge and no spurious NA row can ever be created
+  (which a per-site state POST on an absent record would do). Control
+  panel: per-row "Set transfer priority..." (0–100, pre-filled from
+  the row's roll-up; priority 0 is valid — no `or 50` falsy-zero, and
+  no value==current shortcut, since re-entering the shown roll-up is
+  how diverged sides get equalized).
+- **(G) Zero-record backfill.** New `POST /{project}/state/backfill`
+  (CurrentUser; `siteName` query param): stamps a fully-synced record
+  onto active representations with NO `sitesync_files_status` rows at
+  all (Push-to-project, editorial ingest, publish with sitesync
+  disabled/crashed — the NA/NA-invisible-forever class). The client
+  passes the project's resolved REMOTE site — stamping a site outside
+  the active/remote pair would not make the repre syncable and would
+  permanently consume its zero-record state ('studio' is only the
+  server-side fallback). One set-based `INSERT ... SELECT` with the
+  files JSON built in SQL (no per-row round-trips, no long-held
+  transaction), `NOT EXISTS` + `ON CONFLICT DO NOTHING`, and a 1h
+  per-(project, site) server-side throttle because every participating
+  tray triggers it. The sync thread calls it once per project per tray
+  session (`_backfilled_projects`), only when the machine's pair is
+  non-degenerate, via `run_in_executor` so a big first run can't block
+  the event loop. KNOWN LIMIT (accepted interim per the audit): it
+  stamps availability on faith — a publish whose bytes exist only on
+  the crashed machine's disk will produce failing downloads until the
+  files reach the remote site.
+- **(E) "Download my renders"** (control panel button).
+  `AutoDownloader.download_renders()` follows `generative` links in the
+  **output** direction (`get_linked_representation_id` grew
+  `link_direction`; also accepts a list of link types now) from the
+  last published workfile version of assigned + tracked tasks, then
+  queues repres that are remote-OK/local-NA. Ignores the auto-download
+  ledger and the ARTIST-LOCAL switch (an explicit request beats a
+  prior removal) but **respects the studio-wide `enable_auto_download`
+  kill switch** — renders are the heaviest data and an admin
+  protecting the VPN must not be bypassable from a button — plus pause
+  and `min_free_space_gb`.
+- **(C) "Clean up superseded versions..."** (control panel button).
+  List-first, per the audit's "no automatic policy until this earns
+  trust": scans rows that are **both** local-OK and remote-OK (deleting
+  loses nothing), groups by (PRODUCT ID, representation name) — product
+  id fetched from version entities because folder/product names repeat
+  across hierarchies, and per-representation-name so a newer version
+  downloaded only as `mov` cannot doom the older version's `exr` twin —
+  offers only versions with a NEWER same-name representation fully
+  downloaded on this machine, skips hero versions (negative numbers);
+  confirm dialog shows count + size with the full list behind Qt's
+  "Show Details..." (inlining rows outgrows the screen), then
+  `remove_site(remove_local_files=True)` per row (sibling-file guard
+  applies). The one-shot buttons (renders/cleanup) re-enable ONLY via
+  their own completion signals — a shared `_action_done` must not
+  re-enable a button whose worker still runs.
+
 ## Added on `luma` (unreleased, after opt-in): full-audit fix batch
 
 One batch implementing every actionable finding of the 2026-07-17 full
@@ -250,11 +359,11 @@ Client (`addon.py`, `auto_download.py`, `tray_control_window.py`,
   dependencies now come along); ledger pruned of deleted representations
   once per project per tray session (`_prune_project_ledger`).
 
-NOT implemented: see *"Deferred from the 2026-07-17 full audit"* under
-**Possible Future Work** for the detailed list (USD/Loader dependency
-pull, core UI poll timer, retention/GC, priority wiring, farm renders,
-published-tab UX, orphan-repre backfill) with design questions and
-recommended first steps per item.
+NOT implemented at the time: the deferred list. Since 2026-07-18 most
+of it HAS shipped addon-side — see *"deferred-audit items A/C/D/E/G"*
+above; only the core-fork UI items (live-% poll timer, published-tab
+UX) remain in *"Deferred from the 2026-07-17 full audit"* under
+**Possible Future Work**.
 
 ## Added on `luma` (unreleased, after `0.9.0`): all-in-one sync control panel
 
@@ -939,33 +1048,21 @@ An empty scene therefore means the task had no published workfile matching its
 ### Deferred from the 2026-07-17 full audit (read before extending sitesync)
 
 The full audit (see the "full-audit fix batch" section above for what WAS
-fixed) deliberately left the items below unimplemented. Each is either
-ayon-core's code, a product decision with real trade-offs, or a new
-server capability. Priorities: **item A and item G first** — A because
-USD workflows will hit it, G because its failure mode is the worst kind
-(silent, permanent, invisible).
+fixed) deliberately left seven items unimplemented. **2026-07-18 update:
+A, C, D, E and G have since been implemented entirely addon-side** — see
+*"deferred-audit items A/C/D/E/G"* near the top of this file for what
+shipped and the rules that came with it. Only B and F below remain
+deferred; both are core-fork UI edits.
 
-**A. Loader dependency-pull for non-workfile products — the real USD gap.**
-Downloading a USD assembly/layered look via the Loader pulls exactly one
-representation. `ayon-core tools/loader/models/sitesync.py::_add_site`
-hardcodes `if product_type != "workfile": return` (upstream's own comment:
-"TODO this should happen in site sync addon") and follows only `reference`
-links. Two design questions block a naive fix:
-- *Link types*: `integrate_inputlinks.py` writes `reference` links for
-  what a workfile LOADED and `generative` links for what a version was
-  MADE FROM. A USD look → its texture product is typically `generative`,
-  so dropping the product-type guard while keeping `"reference"` pulls
-  nothing for most USD cases. Follow `reference` + `generative` inputs,
-  depth-limited.
-- *Link existence*: links only exist if the DCC addon populated
-  `loadedVersions`/`inputVersions`/`inputRepresentations` at publish.
-  **First step: check one real production USD publish for links**
-  (`GET /versions/{id}/links`). If present → ~15-line change in the core
-  fork's `_add_site` (reuse `auto_download_link_depth`). If absent → it
-  is a publish-side collection problem in the USD plugins, own design.
-Partial mitigation already shipped: auto-download follows `reference`
-links to `auto_download_link_depth` (default 2), which covers
-workfile-loaded content but not direct Loader downloads.
+**~~A. Loader dependency-pull for non-workfile products~~ — IMPLEMENTED
+2026-07-18** inside the addon's `add_site` (core calls it before its
+workfile-only guard, so no core change was needed after all; follows
+`reference` + `generative` inputs to `auto_download_link_depth`). Still
+open from the original notes: *link existence* — links only exist if the
+DCC addon populated `loadedVersions`/`inputVersions` at publish, so
+**check one real production USD publish for links**
+(`GET /versions/{id}/links`); if absent, it is a publish-side collection
+problem in the USD plugins and no amount of link-following helps.
 
 **B. Live-progress poll timer in core's Manager/Loader.** The audit batch
 made the per-file 0-1 fraction real in the DB for the first time, but
@@ -975,30 +1072,23 @@ stopped when settled, is a small self-contained change in the core fork;
 sitesync needs nothing more. The tray control panel already polls, so
 artists have one place to watch transfers meanwhile.
 
-**C. Local retention / GC of downloaded data.** Nothing ever deletes old
-downloads; `min_free_space_gb` only stops NEW downloads (a brake, not a
-cleaner). Product questions first: delete what (superseded versions?
-unassigned tasks? age?), when, and how to respect artist intent (keeping
-v003 deliberately while v007 exists). Mechanics are ready:
-`remove_site(remove_local_files=True)` per repre is now safe thanks to
-the sibling-guard. Start conservative: a tray action "Clean up superseded
-versions" that LISTS what it would remove with size totals - no
-automatic policy until that has earned trust.
+**~~C. Local retention / GC of downloaded data~~ — IMPLEMENTED
+2026-07-18** as the conservative shape this note asked for: the control
+panel's "Clean up superseded versions..." lists candidates with size
+totals and deletes only on confirmation. An automatic policy remains
+undesigned — do not add one until the manual action has earned trust.
 
-**D. Priority is schema-deep but wired to nothing.** The table, index,
-POST model and `update_db` all carry `priority` - but no UI sets it AND
-the sync loop never orders by it (`/state`'s `SortByEnum` doesn't even
-offer priority, so the loop's fetch ignores it). Making it real = add
-priority to `SortByEnum` + ORDER BY, sort the loop fetch, add a tray
-context-menu control. Cheap; do it when "sync this shot first" is asked.
+**~~D. Priority is schema-deep but wired to nothing~~ — IMPLEMENTED
+2026-07-18**: `SortByEnum.priority` + ORDER BY, loop fetch sorted
+descending, launch-hook workfile downloads post 99, control-panel
+per-row "Set transfer priority...".
 
-**E. Farm renders never reach an artist's local site.** Farm publishes
-mark `studio=OK` only; auto-download follows workfile + `reference`
-links, which exclude render outputs. Deliberate for now - renders are the
-heaviest data and auto-pulling could saturate VPN + disks. If wanted:
-either follow `generative` links FROM the task's workfile version (its
-outputs) behind a default-off setting, or - preferred first - a per-task
-"download my latest renders" pull-on-demand action.
+**~~E. Farm renders never reach an artist's local site~~ — IMPLEMENTED
+2026-07-18** as the preferred pull-on-demand variant: the control
+panel's "Download my renders" follows `generative` output links from
+the latest published workfile versions of the user's tasks. The
+automatic default-off variant was deliberately NOT built (renders are
+the heaviest data; auto-pulling could saturate VPN + disks).
 
 **F. Published-tab discoverability** (see § 1c below): the colleague's
 workfile is visible-but-inert (`Qt.NoItemFlags` in core's
@@ -1006,17 +1096,14 @@ workfile is visible-but-inert (`Qt.NoItemFlags` in core's
 fetch it. Minimum: tooltip. Proper: selectable-when-unavailable +
 Download action (`add_site` + poll). Both are core-fork edits.
 
-**G. Backfill for repres created outside the normal publish.** Core's
-Push-to-project, editorial ingest, or a publish from a machine where the
-sitesync addon was disabled/crashed create representations with NO site
-records - an NA/NA pair is invisible to the sync loop forever and nothing
-detects it. The rewritten `validate_project` can heal the LOCAL side
-(honest per-file adopt) but nothing creates the missing STUDIO record.
-Clean fix: server-side event handler on representation creation (or a
-periodic job) stamping default site records - a new server capability,
-needs its own design (what sites should a pushed repre get?). Cheap
-interim: a one-off script creating `studio=OK` rows for repres with zero
-site rows, plus an adopt run.
+**~~G. Backfill for repres created outside the normal publish~~ —
+IMPLEMENTED 2026-07-18** as the endpoint variant:
+`POST /{project}/state/backfill` stamps `studio=OK` on zero-record
+representations, triggered once per project per tray session by the
+sync thread. The "clean fix" (a server-side event handler reacting to
+representation creation) would need a sitesync addon *service* — still
+possible without touching core, but new infrastructure; revisit only if
+the once-per-session cadence proves too slow in practice.
 
 **Deliberately untouched smalls:** `update_db`'s dead `pause`-key POST
 (harmless, removing it grows the upstream diff); alternative-site

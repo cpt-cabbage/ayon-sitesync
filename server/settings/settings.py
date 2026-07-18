@@ -50,6 +50,17 @@ class GeneralSubmodel(BaseSettingsModel):
                     " loaded asset's own linked dependencies). Each extra"
                     " level costs additional link queries per task."
     )
+    manual_transfer_dependencies: bool = Field(
+        True,
+        title="Include linked dependencies in manual transfers",
+        description="When a representation is downloaded/uploaded manually"
+                    " (Loader, Scene Inventory, sync control panel), also"
+                    " queue the representations its version links to"
+                    " ('reference' and 'generative' inputs, followed to"
+                    " the auto-download link depth). Covers USD"
+                    " assemblies/looks whose layers and textures live in"
+                    " linked products."
+    )
     min_free_space_gb: int = Field(
         5,
         title="Auto-download minimum free space (GB)",

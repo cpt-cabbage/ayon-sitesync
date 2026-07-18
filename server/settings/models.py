@@ -29,6 +29,10 @@ class SortByEnum(enum.Enum):
     representation: str = "representation"
     localStatus: str = "localStatus"
     remoteStatus: str = "remoteStatus"
+    # highest of the two sides' stored priorities (see the query's
+    # 'priority' select alias) - the sync loop sorts by this descending
+    # so "sync this first" requests actually jump the queue
+    priority: str = "priority"
 
 
 class SyncStatusModel(OPModel):
@@ -72,6 +76,9 @@ class SiteSyncSummaryItem(OPModel):
     localStatus: SyncStatusModel
     remoteStatus: SyncStatusModel
     version_id: str = Field(...)
+    # highest stored priority of the two sides (50 = default). Clients
+    # use it to pre-fill the "Set transfer priority" control.
+    priority: int = Field(50)
 
     files: list[FileModel] | None = Field(
         None,

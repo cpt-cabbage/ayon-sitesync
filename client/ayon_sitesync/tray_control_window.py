@@ -40,6 +40,9 @@ _QUEUE_PAGE_LENGTH = 100
 # pathological backlog (500+ active rows per side).
 _QUEUE_MAX_PAGES = 5
 _FILES_PAGE_LENGTH = 200
+# pages scanned per project by the superseded-versions cleanup
+# (200 rows each - only bounds a truly enormous local footprint)
+_CLEANUP_MAX_PAGES = 50
 
 _ACTIVE_STATUSES = (
     SiteSyncStatus.IN_PROGRESS,
@@ -279,6 +282,93 @@ def _collect_file_rows(addon, project_name, page, status, search_text):
     return rows
 
 
+def _collect_superseded_rows(addon):
+    """Locally downloaded representations superseded by a newer version.
+
+    Runs in a worker thread. A representation qualifies only when BOTH
+    sides are fully synced (the remote copy guarantees deleting the local
+    bytes loses nothing) and a NEWER version of the same product AND the
+    same representation name is also fully synced on this machine - a
+    newer version downloaded only as 'mov' must not offer its older
+    version's 'exr' twin for deletion. "Superseded" is judged against
+    what the artist actually has, not against server versions never
+    downloaded. Hero versions (negative numbers) are ignored entirely.
+    Products are matched by product id fetched from the version entities,
+    never by folder/product name, which can repeat across a hierarchy.
+    """
+    local_site_id = get_local_site_id()
+    entries = []
+    for project_name in addon.get_enabled_projects():
+        try:
+            local_site = addon.get_active_site(project_name)
+            remote_site = addon.get_remote_site(project_name)
+            if local_site != local_site_id or local_site == remote_site:
+                continue
+
+            rows = _fetch_state_pages(
+                addon, project_name,
+                _CLEANUP_MAX_PAGES, _FILES_PAGE_LENGTH,
+                localSite=local_site,
+                remoteSite=remote_site,
+                localStatusFilter=[SiteSyncStatus.OK],
+                remoteStatusFilter=[SiteSyncStatus.OK],
+            )
+            if not rows:
+                continue
+
+            product_id_by_version_id = {}
+            version_ids = list({row["versionId"] for row in rows})
+            chunk_size = 500
+            for chunk_start in range(0, len(version_ids), chunk_size):
+                chunk = version_ids[chunk_start:chunk_start + chunk_size]
+                for version in ayon_api.get_versions(
+                    project_name,
+                    version_ids=chunk,
+                    fields={"id", "productId"}
+                ):
+                    product_id_by_version_id[version["id"]] = (
+                        version["productId"]
+                    )
+
+            rows_by_key = {}
+            for row in rows:
+                version = row.get("version") or 0
+                if version <= 0:
+                    continue
+                product_id = product_id_by_version_id.get(
+                    row["versionId"])
+                if not product_id:
+                    continue
+                key = (product_id, row.get("representation") or "")
+                rows_by_key.setdefault(key, []).append((version, row))
+
+            for grouped in rows_by_key.values():
+                newest = max(version for version, _row in grouped)
+                for version, row in grouped:
+                    if version >= newest:
+                        continue
+                    entries.append({
+                        "project": project_name,
+                        "repre_id": row["representationId"],
+                        "local_site": local_site,
+                        "size": row.get("size") or 0,
+                        "label": "{} / {} / {} (v{:03d}) / {}".format(
+                            project_name,
+                            row.get("folder") or "",
+                            row.get("product") or "",
+                            version,
+                            row.get("representation") or "",
+                        ),
+                    })
+        except Exception:
+            addon.log.warning(
+                "Cleanup scan failed for project '{}'".format(
+                    project_name),
+                exc_info=True
+            )
+    return entries
+
+
 class SyncControlWindow(QtWidgets.QWidget):
     """Tray-owned window bundling every artist-facing sync control."""
 
@@ -286,6 +376,12 @@ class SyncControlWindow(QtWidgets.QWidget):
     _files_done = QtCore.Signal(object)
     _action_done = QtCore.Signal(str)
     _projects_done = QtCore.Signal(object)
+    # the one-shot buttons get dedicated completion signals so ONLY their
+    # own worker re-enables them - a shared completion (e.g. a quick row
+    # retry finishing) must not re-enable a button whose worker still runs
+    _renders_done = QtCore.Signal(str)
+    _cleanup_scan_done = QtCore.Signal(object)
+    _cleanup_remove_done = QtCore.Signal(str)
 
     def __init__(self, addon, parent=None):
         super(SyncControlWindow, self).__init__(parent)
@@ -328,6 +424,9 @@ class SyncControlWindow(QtWidgets.QWidget):
         self._files_done.connect(self._apply_file_rows)
         self._action_done.connect(self._on_action_done)
         self._projects_done.connect(self._apply_projects)
+        self._renders_done.connect(self._on_renders_done)
+        self._cleanup_scan_done.connect(self._on_cleanup_scan_done)
+        self._cleanup_remove_done.connect(self._on_cleanup_remove_done)
 
     # widget building ----------------------------------------------------
     def _build_controls_bar(self):
@@ -354,6 +453,26 @@ class SyncControlWindow(QtWidgets.QWidget):
         auto_chk.clicked.connect(self._on_auto_download_clicked)
         self._auto_chk = auto_chk
 
+        renders_btn = QtWidgets.QPushButton("Download my renders", self)
+        renders_btn.setToolTip(
+            "Queue the latest published renders of your assigned and"
+            " recently opened tasks (outputs generated from their newest"
+            " published workfiles) for download to this machine."
+        )
+        renders_btn.clicked.connect(self._on_download_renders)
+        self._renders_btn = renders_btn
+
+        cleanup_btn = QtWidgets.QPushButton(
+            "Clean up superseded versions...", self
+        )
+        cleanup_btn.setToolTip(
+            "List downloaded versions that already have a newer version"
+            " on this machine and optionally delete their local files."
+            " Only versions fully synced to the remote site are offered."
+        )
+        cleanup_btn.clicked.connect(self._on_cleanup)
+        self._cleanup_btn = cleanup_btn
+
         adopt_btn = QtWidgets.QPushButton(
             "Adopt existing local files", self
         )
@@ -370,7 +489,9 @@ class SyncControlWindow(QtWidgets.QWidget):
         bar.addWidget(sync_now_btn)
         bar.addWidget(pause_chk)
         bar.addWidget(auto_chk)
+        bar.addWidget(renders_btn)
         bar.addStretch(1)
+        bar.addWidget(cleanup_btn)
         bar.addWidget(adopt_btn)
         bar.addWidget(web_btn)
         return bar
@@ -720,6 +841,14 @@ class SyncControlWindow(QtWidgets.QWidget):
         self._refresh_queue()
         self._refresh_files()
 
+    def _on_renders_done(self, message):
+        self._renders_btn.setEnabled(True)
+        self._on_action_done(message)
+
+    def _on_cleanup_remove_done(self, message):
+        self._cleanup_btn.setEnabled(True)
+        self._on_action_done(message)
+
     # controls bar actions -----------------------------------------------
     def _on_sync_now(self):
         self._addon._on_tray_sync_now()
@@ -734,6 +863,122 @@ class SyncControlWindow(QtWidgets.QWidget):
 
     def _on_adopt(self):
         self._addon._on_tray_validate()
+
+    def _on_download_renders(self):
+        self._renders_btn.setEnabled(False)
+        self._status_label.setText("Looking for renders to download...")
+        addon = self._addon
+
+        def _run():
+            try:
+                count = addon.download_my_renders()
+                if count:
+                    message = (
+                        "Queued {} render representation(s) for"
+                        " download".format(count)
+                    )
+                else:
+                    message = (
+                        "No new renders to download for your tasks"
+                    )
+            except Exception:
+                addon.log.warning(
+                    "Render download failed", exc_info=True
+                )
+                message = "Render download failed - see the log"
+            self._renders_done.emit(message)
+
+        self._run_bg(_run)
+
+    def _on_cleanup(self):
+        self._cleanup_btn.setEnabled(False)
+        self._status_label.setText("Scanning for superseded versions...")
+        addon = self._addon
+
+        def _run():
+            try:
+                entries = _collect_superseded_rows(addon)
+            except Exception:
+                addon.log.warning(
+                    "Cleanup scan failed", exc_info=True
+                )
+                entries = None
+            self._cleanup_scan_done.emit(entries)
+
+        self._run_bg(_run)
+
+    def _on_cleanup_scan_done(self, entries):
+        self._cleanup_btn.setEnabled(True)
+        if entries is None:
+            self._status_label.setText("Cleanup scan failed - see the log")
+            return
+        if not entries:
+            self._status_label.setText(
+                "Nothing to clean up - no superseded versions are"
+                " downloaded on this machine"
+            )
+            return
+
+        total_size = sum(entry["size"] for entry in entries)
+        lines = [
+            "{} - {}".format(entry["label"], _format_size(entry["size"]))
+            for entry in entries
+        ]
+
+        # summary in the message, full list only behind Qt's own
+        # "Show Details..." - inlining rows makes the (non-scrolling)
+        # message box outgrow the screen for exactly the big cleanups
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Clean up superseded versions")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText(
+            "Delete the local files of {} representation(s) that already"
+            " have a newer version of the same representation downloaded"
+            " on this machine, freeing about {}?\n\nEverything listed is"
+            " fully synced on the remote site and can be downloaded again"
+            " at any time. Click 'Show Details...' for the full"
+            " list.".format(len(entries), _format_size(total_size))
+        )
+        box.setDetailedText("\n".join(lines))
+        box.setStandardButtons(
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        box.setDefaultButton(QtWidgets.QMessageBox.No)
+        if box.exec_() != QtWidgets.QMessageBox.Yes:
+            self._status_label.setText("Cleanup cancelled")
+            return
+
+        self._cleanup_btn.setEnabled(False)
+        self._status_label.setText("Removing superseded versions...")
+        addon = self._addon
+
+        def _run():
+            removed = 0
+            freed = 0
+            for entry in entries:
+                try:
+                    addon.remove_site(
+                        entry["project"],
+                        entry["repre_id"],
+                        entry["local_site"],
+                        remove_local_files=True
+                    )
+                    removed += 1
+                    freed += entry["size"]
+                except Exception:
+                    addon.log.warning(
+                        "Couldn't remove '{}'".format(entry["label"]),
+                        exc_info=True
+                    )
+            message = (
+                "Removed {} of {} representation(s), freed about"
+                " {}".format(removed, len(entries), _format_size(freed))
+            )
+            if removed < len(entries):
+                message = "{} - see the log for failures".format(message)
+            self._cleanup_remove_done.emit(message)
+
+        self._run_bg(_run)
 
     def _on_open_web(self):
         self._addon._on_tray_open_web()
@@ -799,6 +1044,19 @@ class SyncControlWindow(QtWidgets.QWidget):
                     r, r["remote_site"], "Upload queued")
             )
 
+        # priority lives on the site records - at least one must exist
+        if (
+            local_status != SiteSyncStatus.NA
+            or remote_status != SiteSyncStatus.NA
+        ):
+            action = menu.addAction("Set transfer priority...")
+            action.setToolTip(
+                "Higher priority transfers first (default 50)."
+            )
+            action.triggered.connect(
+                lambda _=False, r=row: self._set_row_priority(r)
+            )
+
         if addon.is_representation_paused(repre_id):
             action = menu.addAction("Resume syncing this file")
             action.triggered.connect(
@@ -857,8 +1115,12 @@ class SyncControlWindow(QtWidgets.QWidget):
 
         def _run():
             try:
+                # follow_links=True explicitly: a manual per-row
+                # download/upload has the same semantics as a Loader
+                # transfer, dependencies included
                 addon.add_site(
-                    row["project"], row["repre_id"], site_name, force=True
+                    row["project"], row["repre_id"], site_name,
+                    force=True, follow_links=True
                 )
                 self._action_done.emit(
                     "{}: {}".format(done_message, row["label"]))
@@ -869,6 +1131,43 @@ class SyncControlWindow(QtWidgets.QWidget):
                 )
                 self._action_done.emit(
                     "Couldn't queue transfer - see the log")
+
+        self._run_bg(_run)
+
+    def _set_row_priority(self, row):
+        # no 'or 50': priority 0 is a valid stored value and must
+        # pre-fill as 0, not as the default
+        current = row["repre"].get("priority")
+        if current is None:
+            current = 50
+        value, accepted = QtWidgets.QInputDialog.getInt(
+            self,
+            "Transfer priority",
+            "Priority for\n{}\n\n0-100, higher transfers first"
+            " (default 50):".format(row["label"]),
+            int(current), 0, 100
+        )
+        if not accepted:
+            return
+
+        # No 'value == current' shortcut: 'current' is the server's
+        # highest-of-both-sides roll-up, so re-entering the shown value
+        # is exactly how diverged sides get equalized.
+        addon = self._addon
+
+        def _run():
+            try:
+                addon.set_representation_priority(
+                    row["project"], row["repre_id"], value
+                )
+                self._action_done.emit(
+                    "Priority {} set for {}".format(value, row["label"]))
+            except Exception:
+                addon.log.warning(
+                    "Couldn't set transfer priority", exc_info=True
+                )
+                self._action_done.emit(
+                    "Couldn't set priority - see the log")
 
         self._run_bg(_run)
 

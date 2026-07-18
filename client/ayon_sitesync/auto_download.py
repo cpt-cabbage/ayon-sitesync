@@ -37,6 +37,7 @@ from .utils import (
     SiteAlreadyPresentError,
     SiteSyncStatus,
     get_last_published_workfile_representation,
+    get_link_depth,
     get_linked_representation_id,
 )
 
@@ -47,13 +48,6 @@ _LEDGER_FILE_NAME = "sitesync_autodownload.json"
 # Upper bound of newly queued representations per project per pass -
 # keeps one giant backlog from starving actual transfers.
 MAX_QUEUED_PER_PASS = 50
-
-# Fallback for the 'auto_download_link_depth' server setting: how deep
-# to follow 'reference' links from a workfile. Depth 1 is what the
-# workfile loaded directly, depth 2 also pulls what those inputs
-# reference (e.g. a loaded asset's own linked dependencies). Deeper
-# nesting is rare and each level costs link queries per task.
-DEFAULT_LINK_DEPTH = 2
 
 
 class AutoDownloader:
@@ -102,14 +96,10 @@ class AutoDownloader:
         if now - self._last_run_by_project.get(project_name, 0) < interval:
             return
 
-        local_site = addon.get_active_site(project_name)
-        remote_site = addon.get_remote_site(project_name)
-        if local_site == remote_site:
+        sites = self._transfer_sites(project_name)
+        if sites is None:
             return
-        if local_site != get_local_site_id():
-            # This machine is not the artist's local site (studio
-            # machine, headless site service) - nothing to pre-fetch.
-            return
+        local_site, remote_site = sites
 
         # Stamp before the work so failures don't retry in a hot loop.
         self._last_run_by_project[project_name] = now
@@ -151,8 +141,11 @@ class AutoDownloader:
                 )
                 break
             try:
+                # follow_links=False: reference links were already
+                # followed by '_collect_candidates'
                 addon.add_site(
-                    project_name, repre_id, local_site, force=False
+                    project_name, repre_id, local_site, force=False,
+                    follow_links=False
                 )
                 queued += 1
             except SiteAlreadyPresentError:
@@ -171,6 +164,123 @@ class AutoDownloader:
                 " '{}'".format(queued, project_name)
             )
         self._save_ledger()
+
+    def _transfer_sites(self, project_name):
+        """(local, remote) pair when this machine participates, else None.
+
+        Participating = the resolved pair is non-degenerate AND the
+        local side is this machine's own site. Studio workstations and
+        headless site services have nothing to pre-fetch.
+        """
+        addon = self.addon
+        local_site = addon.get_active_site(project_name)
+        remote_site = addon.get_remote_site(project_name)
+        if local_site == remote_site:
+            return None
+        if local_site != get_local_site_id():
+            return None
+        return local_site, remote_site
+
+    def download_renders(self):
+        """One-shot: queue the latest render outputs of the user's tasks.
+
+        Explicit artist request (sync control panel button), NOT part of
+        the periodic loop: the ledger and the ARTIST-LOCAL auto-download
+        switch are deliberately ignored - asking again after removing a
+        render re-queues it. The studio-wide `enable_auto_download` kill
+        switch, pause and the free-space minimum still apply (renders
+        are the heaviest data; an admin who killed background downloads
+        to protect the VPN must not be bypassable from a button). Renders
+        are found by following 'generative' links in the OUTPUT direction
+        from the last published workfile version of each
+        assigned/recently-opened task (the inverse of what the periodic
+        auto-download follows).
+
+        Returns:
+            int: Number of newly queued representations across projects.
+        """
+        queued_total = 0
+        for project_name in self.addon.get_enabled_projects():
+            try:
+                queued_total += self._download_project_renders(project_name)
+            except Exception:
+                log.warning(
+                    "Render download failed for project '{}'".format(
+                        project_name),
+                    exc_info=True
+                )
+        if queued_total:
+            self.addon.reset_timer()
+        return queued_total
+
+    def _download_project_renders(self, project_name):
+        addon = self.addon
+        settings = addon.sync_project_settings.get(project_name)
+        if not settings or not settings["enabled"]:
+            return 0
+        if addon.is_project_paused(project_name):
+            return 0
+        config = settings["config"]
+        # the studio-wide kill switch covers this button too; only the
+        # artist-local pref and the ledger are bypassed
+        if not config.get("enable_auto_download", True):
+            return 0
+
+        sites = self._transfer_sites(project_name)
+        if sites is None:
+            return 0
+        local_site, remote_site = sites
+
+        folder_id_by_task_id = self._get_relevant_tasks(
+            project_name, config
+        )
+        candidate_ids = set()
+        for task_id, folder_id in folder_id_by_task_id.items():
+            workfile_repre = get_last_published_workfile_representation(
+                project_name, folder_id, task_id
+            )
+            if not workfile_repre:
+                continue
+            candidate_ids.update(get_linked_representation_id(
+                project_name,
+                workfile_repre,
+                "generative",
+                max_depth=1,
+                link_direction="out",
+            ))
+        if not candidate_ids:
+            return 0
+
+        if not self._enough_free_space(project_name, config):
+            return 0
+
+        # throwaway set instead of the ledger: an explicit request must
+        # not be vetoed by (or pollute) the auto-download memory
+        to_queue = self._filter_by_state(
+            project_name, candidate_ids, local_site, remote_site, set()
+        )
+        queued = 0
+        for repre_id in to_queue:
+            try:
+                addon.add_site(
+                    project_name, repre_id, local_site, force=False,
+                    follow_links=False
+                )
+                queued += 1
+            except SiteAlreadyPresentError:
+                pass
+            except Exception:
+                log.warning(
+                    "Couldn't queue render representation '{}'".format(
+                        repre_id),
+                    exc_info=True
+                )
+        if queued:
+            log.info(
+                "Queued {} render representation(s) for download in"
+                " '{}'".format(queued, project_name)
+            )
+        return queued
 
     def _get_relevant_tasks(self, project_name, config):
         """Tasks whose content should live on this machine.
@@ -230,14 +340,7 @@ class AutoDownloader:
 
     def _collect_candidates(self, project_name, folder_id_by_task_id, config):
         """Last published workfile + referenced repres per relevant task."""
-        try:
-            link_depth = int(
-                config.get("auto_download_link_depth")
-                or DEFAULT_LINK_DEPTH
-            )
-        except (TypeError, ValueError):
-            link_depth = DEFAULT_LINK_DEPTH
-        link_depth = max(link_depth, 1)
+        link_depth = get_link_depth(config)
 
         candidate_ids = set()
         for task_id, folder_id in folder_id_by_task_id.items():
