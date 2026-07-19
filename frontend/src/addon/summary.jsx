@@ -38,23 +38,26 @@ const textMatchModes = [
 const selectMatchModes = [{ label: 'In', matchMode: FilterMatchMode.IN }]
 
 const buildQueryString = (localSite, remoteSite, lazyParams) => {
-  // TODO.... do this less ugly
-  let url = `?localSite=${localSite}&remoteSite=${remoteSite}`
+  // every user-influenced value is URI-encoded: site names may contain
+  // spaces, and '&', '#', '+' or '%' typed into a filter used to
+  // silently corrupt the query string (wrong results, no error)
+  let url = `?localSite=${encodeURIComponent(localSite)}`
+  url += `&remoteSite=${encodeURIComponent(remoteSite)}`
   url += `&pageLength=${lazyParams.rows}&page=${lazyParams.page + 1}`
   url += `&sortBy=${lazyParams.sortField}`
   url += `&sortDesc=${lazyParams.sortOrder === 1 ? 'true' : 'false'}`
   if (lazyParams.filters.folder && lazyParams.filters.folder.value)
-    url += `&folderFilter=${lazyParams.filters.folder.value}`
+    url += `&folderFilter=${encodeURIComponent(lazyParams.filters.folder.value)}`
   if (lazyParams.filters.product && lazyParams.filters.product.value)
-    url += `&productFilter=${lazyParams.filters.product.value}`
+    url += `&productFilter=${encodeURIComponent(lazyParams.filters.product.value)}`
   if (lazyParams.filters.version && lazyParams.filters.version.value)
-    url += `&versionFilter=${lazyParams.filters.version.value}`
+    url += `&versionFilter=${encodeURIComponent(lazyParams.filters.version.value)}`
   if (
     lazyParams.filters.representation &&
     lazyParams.filters.representation.value
   ) {
     for (const val of lazyParams.filters.representation.value)
-      url += `&repreNameFilter=${val}`
+      url += `&repreNameFilter=${encodeURIComponent(val)}`
   }
   if (lazyParams.filters.localStatus && lazyParams.filters.localStatus.value) {
     for (const val of lazyParams.filters.localStatus.value)
@@ -92,6 +95,7 @@ const SiteSyncSummary = ({
   const [selectedRemoteSite, setSelectedRemoteSite] =
     useState(remoteSites && remoteSites[0] && remoteSites[0]["value"])
   const [lazyParams, setLazyParams] = useState(defaultParams)
+  const [errorMessage, setErrorMessage] = useState(null)
 
   useEffect(() => {
     setLoading(true)
@@ -101,12 +105,19 @@ const SiteSyncSummary = ({
                                       lazyParams))
       .then((response) => {
         setRepresentations(response.data.representations)
+        setErrorMessage(null)
+      })
+      .catch(() => {
+        // stale rows with no indication used to be the only "signal"
+        setErrorMessage('Loading the sync state failed - check the server.')
       })
       .finally(() => {
         setLoading(false)
       })
+    // the sites are dependencies too: switching a site dropdown must
+    // refetch even when the params object happens to be unchanged
     // eslint-disable-next-line
-  }, [lazyParams])
+  }, [lazyParams, selectedLocalSite, selectedRemoteSite])
 
   // live progress: while any visible row is transferring, silently
   // re-poll so the progress bars actually move (the client writes
@@ -133,17 +144,24 @@ const SiteSyncSummary = ({
   }, [representations])
 
   const updateSite = (event, site_type) => {
-    /* Updates site after selection change, triggers refresh.*/
+    /* Updates site after selection change, triggers refresh.
+     *
+     * A FRESH object is required: mutating and re-setting the
+     * module-level `defaultParams` was a same-reference state update on
+     * first load, so React bailed out, the fetch effect never re-ran
+     * and the table kept showing the previous site pair's data. */
     if (site_type == "local"){
         setSelectedLocalSite(event.value)
     }else{
         setSelectedRemoteSite(event.value)
     }
 
-    let new_event = defaultParams
-    new_event['first'] = 0
-    new_event['page'] = 0
-    setLazyParams(new_event)
+    setLazyParams({
+      ...defaultParams,
+      filters: { ...defaultParams.filters },
+      first: 0,
+      page: 0,
+    })
 }
 
   const retryAllFailed = () => {
@@ -155,9 +173,18 @@ const SiteSyncSummary = ({
     ]
     Promise.allSettled(
       sites.map((site) =>
-        axios.post(`${baseUrl}/resetFailed?siteName=${site}`)
+        axios.post(
+          `${baseUrl}/resetFailed?siteName=${encodeURIComponent(site)}`
+        )
       )
-    ).then(() => {
+    ).then((results) => {
+      // a failed POST used to look identical to success
+      const failed = results.filter((r) => r.status === 'rejected')
+      if (failed.length) {
+        setErrorMessage('Retrying failed transfers did not succeed.')
+      } else {
+        setErrorMessage(null)
+      }
       // refresh the table
       setLazyParams({ ...lazyParams })
     })
@@ -237,6 +264,11 @@ const SiteSyncSummary = ({
             icon="refresh"
             onClick={retryAllFailed}
             style={{ alignSelf: 'flex-start' }} />
+      {errorMessage && (
+        <span style={{ color: 'var(--color-hl-error, #ff6b6b)' }}>
+          {errorMessage}
+        </span>
+      )}
         <TablePanel loading={loading}>
           <DataTable
             scrollable

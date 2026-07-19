@@ -29,8 +29,10 @@ const formatFileSize = (bytes, si = false, dp = 1) => {
 }
 
 const buildQueryString = (representationId, localSite, remoteSite) => {
-  let url = `?localSite=${localSite}&remoteSite=${remoteSite}`
-  url += `&representationIds=${representationId}`
+  // site names may contain spaces - encode everything user-influenced
+  let url = `?localSite=${encodeURIComponent(localSite)}`
+  url += `&remoteSite=${encodeURIComponent(remoteSite)}`
+  url += `&representationIds=${encodeURIComponent(representationId)}`
   return url
 }
 
@@ -96,6 +98,9 @@ const SiteSyncDetail = ({
         ) {
           console.log('ERROR GETTING FILES')
           setFiles([])
+          // without this return the code below dereferenced
+          // response.data.representations and threw
+          return
         }
 
         let result = []
@@ -111,6 +116,10 @@ const SiteSyncDetail = ({
             }
         }
         setFiles(result)
+      })
+      .catch(() => {
+        console.log('ERROR GETTING FILES')
+        setFiles([])
       })
       .finally(() => {
         setLoading(false)
@@ -136,7 +145,8 @@ const SiteSyncDetail = ({
       sites.map((site) =>
         axios.post(
           `${baseUrl}/resetFailed` +
-            `?siteName=${site}&representationId=${representationId}`
+            `?siteName=${encodeURIComponent(site)}` +
+            `&representationId=${encodeURIComponent(representationId)}`
         )
       )
     ).then(() => loadFiles())
