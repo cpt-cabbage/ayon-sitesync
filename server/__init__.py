@@ -1,13 +1,14 @@
 from __future__ import annotations
 import re
 import time
+import uuid
 from typing import Any, Type
 from nxtools import logging
 import os
 from fastapi import Path, Query, Response
 
 from ayon_server.addons import BaseServerAddon
-from ayon_server.exceptions import BadRequestException
+from ayon_server.exceptions import BadRequestException, ForbiddenException
 
 from ayon_server.access.utils import folder_access_list
 from ayon_server.api.dependencies import (
@@ -77,6 +78,12 @@ class SiteSync(BaseServerAddon):
             method="POST",
         )
 
+        self.add_endpoint(
+            "/{project_name}/state/requeueStale",
+            self.requeue_stale_in_progress,
+            method="POST",
+        )
+
         # NOTE: registered before the generic
         # '/{project_name}/state/{representation_id}/{site_name}' POST so
         # the literal 'setPriority' segment wins route matching
@@ -117,29 +124,34 @@ class SiteSync(BaseServerAddon):
         if access_list is not None:
             conditions.append(f"h.path like ANY ('{{ {','.join(access_list)} }}')")
 
-        # The window count runs over the already-DISTINCT subquery, so
-        # 'count' is the number of distinct representation names (it used
-        # to be the raw row count computed before DISTINCT collapsed).
+        # 'count' MUST be the raw representation row count - the web
+        # frontend feeds it straight into the DataTable's 'totalRecords',
+        # so a DISTINCT-collapsed value (a handful of repre names) caps
+        # the paginator at one page and everything past it becomes
+        # unreachable. 'names' stays DISTINCT for the filter dropdown.
+        # One aggregate query - the 4-table join runs once, not twice.
         query = f"""
-            SELECT name, COUNT (*) OVER () as total_count
-            FROM (
-                SELECT DISTINCT(r.name) as name
-                FROM project_{project_name}.representations as r
-                INNER JOIN project_{project_name}.versions as v
-                    ON r.version_id = v.id
-                INNER JOIN project_{project_name}.products as p
-                    ON v.product_id = p.id
-                INNER JOIN project_{project_name}.hierarchy as h
-                    ON p.folder_id = h.id
-                {SQLTool.conditions(conditions)}
-            ) as distinct_names
+            SELECT
+                COUNT(*) as total_count,
+                COALESCE(
+                    array_agg(DISTINCT r.name), ARRAY[]::VARCHAR[]
+                ) as names
+            FROM project_{project_name}.representations as r
+            INNER JOIN project_{project_name}.versions as v
+                ON r.version_id = v.id
+            INNER JOIN project_{project_name}.products as p
+                ON v.product_id = p.id
+            INNER JOIN project_{project_name}.hierarchy as h
+                ON p.folder_id = h.id
+            {SQLTool.conditions(conditions)}
         """
 
         total_count = 0
         names = []
-        async for row in Postgres.iterate(query):
-            total_count = row["total_count"] or 0
-            names.append(row["name"])
+        result = await Postgres.fetch(query)
+        if result:
+            total_count = result[0]["total_count"] or 0
+            names = list(result[0]["names"] or [])
 
         return SiteSyncParamsModel(count=total_count, names=names)
 
@@ -309,13 +321,17 @@ class SiteSync(BaseServerAddon):
         ]
 
         if representationIds is not None:
-            conditions.append(f"r.id IN {SQLTool.array(representationIds)}")
+            conditions.append(
+                f"r.id IN {sql_array(validate_id_list(representationIds))}"
+            )
 
         if folderFilter:
             conditions.append(f"f.name ILIKE '%{escape_ilike(folderFilter)}%'")
 
         if folderIdsFilter:
-            conditions.append(f"f.id IN {SQLTool.array(folderIdsFilter)}")
+            conditions.append(
+                f"f.id IN {sql_array(validate_id_list(folderIdsFilter))}"
+            )
 
         if productFilter:
             conditions.append(
@@ -326,7 +342,9 @@ class SiteSync(BaseServerAddon):
             conditions.append(f"v.version = {versionFilter}")
 
         if versionIdsFilter:
-            conditions.append(f"v.id IN {SQLTool.array(versionIdsFilter)}")
+            conditions.append(
+                f"v.id IN {sql_array(validate_id_list(versionIdsFilter))}"
+            )
 
         if localStatusFilter:
             statusFilter = [str(s.value) for s in localStatusFilter]
@@ -337,7 +355,7 @@ class SiteSync(BaseServerAddon):
             conditions.append(f"remote.status IN ({','.join(statusFilter)})")
 
         if repreNameFilter:
-            conditions.append(f"r.name IN {SQLTool.array(repreNameFilter)}")
+            conditions.append(f"r.name IN {sql_array(repreNameFilter)}")
 
         access_list = await folder_access_list(user, project_name, "read")
         if access_list is not None:
@@ -391,10 +409,14 @@ class SiteSync(BaseServerAddon):
 
             {SQLTool.conditions(conditions)}
 
-            ORDER BY {sortBy.value} {'DESC' if sortDesc else 'ASC'}
+            ORDER BY {sortBy.value} {'DESC' if sortDesc else 'ASC'}, r.id ASC
             LIMIT {pageLength}
             OFFSET { (page-1) * pageLength }
         """
+        # ', r.id' tiebreaker: every sort key is non-unique (most rows
+        # share priority 50), and without a total order equal-key rows
+        # shuffle across page boundaries - the sync loop and the UI both
+        # page explicitly, so rows would be skipped or duplicated.
         repres = []
 
         async for row in Postgres.iterate(query):
@@ -514,6 +536,23 @@ class SiteSync(BaseServerAddon):
         to QUEUED and 'retries'/'message' are cleared.
         """
         await check_sync_status_table(project_name)
+        validate_site_name(site_name)
+
+        access_condition = ""
+        if representation_id:
+            await ensure_representation_access(
+                project_name, user, representation_id
+            )
+        else:
+            # Users with restricted folder access may only batch-reset
+            # representations inside their subtree - mirroring the folder
+            # ACL the read endpoints already apply.
+            access_list = await folder_access_list(user, project_name, "read")
+            if access_list is not None:
+                access_condition = (
+                    "AND representation_id IN "
+                    f"{acl_repre_subquery(project_name, access_list)}"
+                )
 
         reset_count = 0
         async with Postgres.acquire() as conn:
@@ -535,18 +574,30 @@ class SiteSync(BaseServerAddon):
                     # IN_PROGRESS above FAILED, so a representation with
                     # one failed file and one still transferring would
                     # otherwise be skipped by "retry all failed".
+                    # CASE guards jsonb_each: one legacy/malformed row
+                    # whose 'files' is not a JSON object must not 500 the
+                    # whole batch (AND does not guarantee evaluation
+                    # order, CASE does). The jsonb equality avoids ::int
+                    # casts raising on non-numeric statuses for the same
+                    # reason.
                     rows = await conn.fetch(
                         f"""
                         SELECT representation_id, data
                         FROM project_{project_name}.sitesync_files_status
                         WHERE site_name = $1 AND (
                             status = $2
-                            OR EXISTS (
-                                SELECT 1
-                                FROM jsonb_each(data->'files') AS fs
-                                WHERE (fs.value->>'status')::int = $2
-                            )
+                            OR CASE
+                                WHEN jsonb_typeof(data->'files') = 'object'
+                                THEN EXISTS (
+                                    SELECT 1
+                                    FROM jsonb_each(data->'files') AS fs
+                                    WHERE fs.value->'status'
+                                        = to_jsonb($2::integer)
+                                )
+                                ELSE FALSE
+                            END
                         )
+                        {access_condition}
                         FOR UPDATE
                         """,
                         site_name,
@@ -555,6 +606,8 @@ class SiteSync(BaseServerAddon):
 
                 for row in rows:
                     files = (row["data"] or {}).get("files") or {}
+                    if not isinstance(files, dict):
+                        continue
                     changed = False
                     for file_info in files.values():
                         if file_info.get("status") != StatusEnum.FAILED:
@@ -612,12 +665,51 @@ class SiteSync(BaseServerAddon):
         # Every participating tray triggers this once per session, so
         # throttle server-side: in the steady state the anti-join scan
         # proves "nothing to do" only by scanning, which is not free on
-        # large projects.
-        throttle_key = (project_name, site_name)
-        now = time.time()
-        if now - _backfill_last_run.get(throttle_key, 0) < _BACKFILL_THROTTLE:
+        # large projects. The throttle lives in 'sitesync_meta' (NOT in
+        # module state, which is per uvicorn worker/replica and resets on
+        # every deploy): one atomic cross-worker claim - the row is
+        # inserted or updated only when the stored timestamp is older
+        # than the window; RETURNING is empty when another worker already
+        # claimed it. Timestamps are bound as bigints - asyncpg's numeric
+        # codec rejects Python floats.
+        now = int(time.time())
+        claim = await Postgres.fetch(
+            f"""
+            INSERT INTO project_{project_name}.sitesync_meta AS meta
+                (key, value)
+            VALUES ($1, jsonb_build_object('last_run', $2::bigint))
+            ON CONFLICT (key) DO UPDATE
+                SET value = jsonb_build_object('last_run', $2::bigint)
+                WHERE COALESCE(
+                    (meta.value->>'last_run')::numeric, 0
+                ) <= $3::bigint
+            RETURNING key
+            """,
+            f"backfill:{site_name}",
+            now,
+            now - _BACKFILL_THROTTLE,
+        )
+        if not claim:
             return {"backfilledCount": 0}
-        _backfill_last_run[throttle_key] = now
+
+        # Users with restricted folder access may only stamp records
+        # inside their subtree (managers and unrestricted users scan the
+        # whole project). Stamping availability on faith is the accepted
+        # design limit of this endpoint - the ACL bounds WHO can do it
+        # WHERE, not the faith itself. The hierarchy join exists ONLY
+        # for this filter, so unrestricted users (the common case - the
+        # caller is each artist's own tray) skip its cost entirely.
+        acl_join = ""
+        access_condition = ""
+        access_list = await folder_access_list(user, project_name, "read")
+        if access_list is not None:
+            acl_join = f"""
+            INNER JOIN project_{project_name}.hierarchy AS h
+                ON p.folder_id = h.id
+            """
+            access_condition = f"""
+              AND h.path like ANY ('{{ {','.join(access_list)} }}')
+            """
 
         # One set-based statement: no per-row round-trips, no long-held
         # transaction, files JSON built in SQL. ON CONFLICT guards a
@@ -647,6 +739,7 @@ class SiteSync(BaseServerAddon):
                 ON r.version_id = v.id
             INNER JOIN project_{project_name}.products AS p
                 ON v.product_id = p.id
+            {acl_join}
             WHERE r.active IS TRUE
               AND v.active IS TRUE
               AND p.active IS TRUE
@@ -656,6 +749,7 @@ class SiteSync(BaseServerAddon):
                   FROM project_{project_name}.sitesync_files_status AS s
                   WHERE s.representation_id = r.id
               )
+              {access_condition}
             ON CONFLICT DO NOTHING
         """
 
@@ -671,6 +765,116 @@ class SiteSync(BaseServerAddon):
             pass
 
         return {"backfilledCount": backfilled}
+
+    async def requeue_stale_in_progress(
+        self,
+        project_name: ProjectName,
+        user: CurrentUser,
+        site_name: str | None = Query(
+            None,
+            alias="siteName",
+            description="Limit the sweep to one site; omitted sweeps"
+                        " every site of the project",
+        ),
+        older_than_seconds: int = Query(
+            3600,
+            alias="olderThanSeconds",
+            ge=60,
+            description="Requeue IN_PROGRESS files whose last update is"
+                        " older than this many seconds",
+        ),
+    ) -> dict[str, int]:
+        """Requeue IN_PROGRESS files that stopped receiving updates.
+
+        A tray killed mid-transfer (crash, sleep, power loss) leaves its
+        files IN_PROGRESS forever: the roll-up ranks IN_PROGRESS above
+        everything, the sync loop only fetches OK/QUEUED pairs, and
+        resetFailed only touches FAILED files - nothing else ever
+        un-sticks them. The state POST stamps a SERVER-side timestamp on
+        every IN_PROGRESS file (see set_site_sync_representation_state),
+        so this comparison is same-clock and immune to artist-machine
+        clock skew; providers post progress every few seconds while
+        genuinely transferring, so a file 'olderThanSeconds' old is
+        dead, not slow. Sweeping ALL sites by default matters: a wiped
+        machine's own tray is exactly the one that will never call this
+        for its site, so any tray's sweep must heal everyone. The
+        staleness predicate lives in SQL so live rows are never fetched
+        or FOR-UPDATE-locked (they are the normal occupants of
+        IN_PROGRESS, and their owner posts progress against the same
+        rows every few seconds).
+        """
+        await check_sync_status_table(project_name)
+        site_condition = ""
+        if site_name:
+            validate_site_name(site_name)
+            site_condition = "AND site_name = $3"
+
+        cutoff = int(time.time()) - older_than_seconds
+        requeued = 0
+        async with Postgres.acquire() as conn:
+            async with conn.transaction():
+                # Roll-up IN_PROGRESS iff any file is IN_PROGRESS (see
+                # get_overal_status). A row with ANY fresh file is a live
+                # transfer and is skipped wholesale; jsonb_typeof CASEs
+                # guard malformed rows (AND/EXISTS do not guarantee
+                # evaluation order, CASE does).
+                query_args = [StatusEnum.IN_PROGRESS, cutoff]
+                if site_name:
+                    query_args.append(site_name)
+                rows = await conn.fetch(
+                    f"""
+                    SELECT representation_id, site_name, data
+                    FROM project_{project_name}.sitesync_files_status
+                    WHERE status = $1
+                      {site_condition}
+                      AND CASE
+                        WHEN jsonb_typeof(data->'files') = 'object'
+                        THEN NOT EXISTS (
+                            SELECT 1
+                            FROM jsonb_each(data->'files') AS fs
+                            WHERE CASE
+                                WHEN jsonb_typeof(fs.value->'timestamp')
+                                    = 'number'
+                                THEN (fs.value->>'timestamp')::numeric
+                                ELSE 0
+                            END > $2::bigint
+                        )
+                        ELSE FALSE
+                      END
+                    FOR UPDATE
+                    """,
+                    *query_args,
+                )
+
+                for row in rows:
+                    files = (row["data"] or {}).get("files") or {}
+                    if not isinstance(files, dict):
+                        continue
+                    changed = False
+                    for file_info in files.values():
+                        if file_info.get("status") != StatusEnum.IN_PROGRESS:
+                            continue
+                        file_info["status"] = StatusEnum.QUEUED
+                        file_info.pop("progress", None)
+                        changed = True
+                    if not changed:
+                        continue
+
+                    status = get_overal_status(files)
+                    await conn.execute(
+                        f"""
+                        UPDATE project_{project_name}.sitesync_files_status
+                        SET status = $1, data = $2
+                        WHERE representation_id = $3 AND site_name = $4
+                        """,
+                        status,
+                        {"files": files},
+                        row["representation_id"],
+                        row["site_name"],
+                    )
+                    requeued += 1
+
+        return {"requeuedCount": requeued}
 
     async def set_representation_priority(
         self,
@@ -688,6 +892,9 @@ class SiteSync(BaseServerAddon):
         spurious NOT_AVAILABLE row; this endpoint deliberately cannot.
         """
         await check_sync_status_table(project_name)
+        await ensure_representation_access(
+            project_name, user, representation_id
+        )
         await Postgres.execute(
             f"""
             UPDATE project_{project_name}.sitesync_files_status
@@ -719,6 +926,10 @@ class SiteSync(BaseServerAddon):
         """
         DEFAULT_PRIORITY = 50
         await check_sync_status_table(project_name)
+        validate_site_name(site_name)
+        await ensure_representation_access(
+            project_name, user, representation_id
+        )
 
         priority = post_data.priority
 
@@ -767,7 +978,18 @@ class SiteSync(BaseServerAddon):
                     if posted_file_id not in files:
                         logging.warning(f"{posted_file} not in files")
                         continue
-                    files[posted_file_id]["timestamp"] = posted_file.timestamp
+                    # IN_PROGRESS files get a SERVER-clock timestamp: the
+                    # stale-transfer requeue compares these against the
+                    # server's own clock, and client-posted wall clocks
+                    # (skewed machines, older client builds re-posting a
+                    # copied old value) would flip live transfers back to
+                    # QUEUED mid-flight - or mask genuinely dead ones.
+                    if posted_file.status == StatusEnum.IN_PROGRESS:
+                        files[posted_file_id]["timestamp"] = int(time.time())
+                    else:
+                        files[posted_file_id]["timestamp"] = (
+                            posted_file.timestamp
+                        )
                     files[posted_file_id]["status"] = posted_file.status
                     files[posted_file_id]["size"] = posted_file.size
 
@@ -798,17 +1020,25 @@ class SiteSync(BaseServerAddon):
                 status = get_overal_status(files)
 
                 if do_insert:
+                    # ON CONFLICT: FOR UPDATE cannot lock a row that does
+                    # not exist yet, so two concurrent first-POSTs for the
+                    # same (repre, site) can both take the insert branch -
+                    # without this the second one 500s on the primary key.
                     await conn.execute(
                         f"""
                         INSERT INTO project_{project_name}.sitesync_files_status
                         (representation_id, site_name, status, priority, data)
                         VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (representation_id, site_name)
+                        DO UPDATE SET
+                            status = EXCLUDED.status,
+                            priority = EXCLUDED.priority,
+                            data = EXCLUDED.data
                         """,
                         representation_id,
                         site_name,
                         status,
-                        priority
-,
+                        priority,
                         {"files": files},
                     )
                 else:
@@ -825,6 +1055,25 @@ class SiteSync(BaseServerAddon):
                         site_name,
                     )
 
+                # An explicitly posted priority applies to ALL of the
+                # representation's rows, exactly like setPriority - a
+                # per-side write here would reintroduce the side
+                # divergence setPriority exists to prevent (add_site can
+                # pass 'priority', e.g. the launch hook's 99). The
+                # IS DISTINCT FROM makes repeat posts (every DCC launch
+                # re-posts 99) no-op writes.
+                if post_data.priority is not None:
+                    await conn.execute(
+                        f"""
+                        UPDATE project_{project_name}.sitesync_files_status
+                        SET priority = $1
+                        WHERE representation_id = $2
+                          AND priority IS DISTINCT FROM $1
+                        """,
+                        post_data.priority,
+                        representation_id,
+                    )
+
         return Response(status_code=204)
 
     async def remove_site_sync_representation_state(
@@ -832,9 +1081,13 @@ class SiteSync(BaseServerAddon):
         project_name: ProjectName,
         user: CurrentUser,
         representation_id: RepresentationID,
-        site_name: str = Path(...),  # TODO: add regex validator/dependency here! Important!
+        site_name: str = Path(...),
     ) -> Response:
         await check_sync_status_table(project_name)
+        validate_site_name(site_name)
+        await ensure_representation_access(
+            project_name, user, representation_id
+        )
 
         async with Postgres.acquire() as conn:
             async with conn.transaction():
@@ -873,11 +1126,14 @@ class SiteSync(BaseServerAddon):
             raise BadRequestException("'representationIds' is required")
 
         conditions = [
-            f"representation_id IN {SQLTool.array(representationIds)}"
+            "representation_id IN "
+            f"{sql_array(validate_id_list(representationIds))}"
         ]
 
         if siteNames:
-            conditions.append(f"site_name IN {SQLTool.array(siteNames)}")
+            for name in siteNames:
+                validate_site_name(name)
+            conditions.append(f"site_name IN {sql_array(siteNames)}")
 
         query = f"""
             SELECT representation_id, site_name, status
@@ -921,6 +1177,85 @@ def escape_ilike(value: str) -> str:
     return value.replace("%", "\\%").replace("_", "\\_")
 
 
+def sql_array(values: list[str]) -> str:
+    """Injection-safe replacement for SQLTool.array on value lists.
+
+    SQLTool.array wraps string elements in single quotes WITHOUT
+    escaping quotes inside them, so feeding it raw user input is an SQL
+    injection. This is the ONLY sanctioned way to build an IN (...)
+    list in this module - never call SQLTool.array directly on request
+    data. Doubling single quotes is sufficient under Postgres'
+    standard_conforming_strings (backslashes are literal in '...').
+    """
+    escaped = [str(value).replace("'", "''") for value in values]
+    return SQLTool.array(escaped)
+
+
+def acl_repre_subquery(project_name: str, access_list: list[str]) -> str:
+    """Subquery of representation ids inside the user's folder subtree.
+
+    The single source of the representations->versions->products->
+    hierarchy ACL join used by every mutating endpoint - keep it in one
+    place so a hardening change cannot miss a copy.
+    """
+    return f"""(
+        SELECT r.id
+        FROM project_{project_name}.representations AS r
+        INNER JOIN project_{project_name}.versions AS v
+            ON r.version_id = v.id
+        INNER JOIN project_{project_name}.products AS p
+            ON v.product_id = p.id
+        INNER JOIN project_{project_name}.hierarchy AS h
+            ON p.folder_id = h.id
+        WHERE h.path like ANY ('{{ {','.join(access_list)} }}')
+    )"""
+
+
+def validate_id_list(values: list[str]) -> list[str]:
+    """Validate entity ids interpolated into SQL IN (...) lists.
+
+    Anything that does not parse as a UUID is rejected with a 400 - this
+    both closes the injection channel and gives callers a clear error
+    instead of a Postgres cast failure.
+    """
+    validated = []
+    for value in values:
+        try:
+            validated.append(uuid.UUID(str(value)).hex)
+        except (ValueError, AttributeError, TypeError):
+            raise BadRequestException(f"Invalid entity id: {value!r}")
+    return validated
+
+
+async def ensure_representation_access(
+    project_name: str,
+    user,
+    representation_id: str,
+) -> None:
+    """Folder-ACL gate for representation-scoped sync mutations.
+
+    The read endpoints already scope results by 'folder_access_list';
+    without this the mutating endpoints (state POST/DELETE, setPriority,
+    per-repre resetFailed) would let a user with restricted folder access
+    rewrite sync state for representations OUTSIDE their subtree.
+    Unrestricted users and managers pass without an extra query.
+    """
+    access_list = await folder_access_list(user, project_name, "read")
+    if access_list is None:
+        return
+    result = await Postgres.fetch(
+        f"""
+        SELECT 1
+        WHERE $1::uuid IN {acl_repre_subquery(project_name, access_list)}
+        """,
+        representation_id,
+    )
+    if not result:
+        raise ForbiddenException(
+            "You do not have access to this representation"
+        )
+
+
 def get_overal_status(files: dict) -> StatusEnum:
     all_states = [v.get("status", StatusEnum.NOT_AVAILABLE) for v in files.values()]
     if all(stat == StatusEnum.NOT_AVAILABLE for stat in all_states):
@@ -946,10 +1281,8 @@ def get_overal_status(files: dict) -> StatusEnum:
 # run three DDL statements per request.
 _ensured_status_tables: set[str] = set()
 
-# Last backfill run per (project, site) in this server process - every
-# participating tray triggers the endpoint once per session, and proving
-# "nothing to backfill" still costs a full anti-join scan.
-_backfill_last_run: dict[tuple[str, str], float] = {}
+# Minimum seconds between backfill scans per (project, site) - enforced
+# cross-worker via the 'sitesync_meta' claim row, never in module state.
 _BACKFILL_THROTTLE = 3600  # seconds
 
 
@@ -969,4 +1302,13 @@ async def check_sync_status_table(project_name: str) -> None:
     )
     await Postgres.execute(f"CREATE INDEX IF NOT EXISTS file_status_idx ON project_{project_name}.sitesync_files_status(status);")
     await Postgres.execute(f"CREATE INDEX IF NOT EXISTS file_priority_idx ON project_{project_name}.sitesync_files_status(priority desc);")
+    # Small key/value side table for addon bookkeeping that must be
+    # shared across server workers/replicas (e.g. the backfill throttle -
+    # module-level state is per process and resets on every deploy).
+    await Postgres.execute(
+        f"""CREATE TABLE IF NOT EXISTS project_{project_name}.sitesync_meta (
+            key VARCHAR PRIMARY KEY,
+            value JSONB NOT NULL DEFAULT '{{}}'::JSONB
+        );"""
+    )
     _ensured_status_tables.add(project_name)

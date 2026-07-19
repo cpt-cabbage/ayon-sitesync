@@ -63,6 +63,7 @@ class GeneralSubmodel(BaseSettingsModel):
     )
     min_free_space_gb: int = Field(
         5,
+        ge=0,
         title="Auto-download minimum free space (GB)",
         description="Skip auto-download when free disk space under the"
                     " local roots drops below this."
