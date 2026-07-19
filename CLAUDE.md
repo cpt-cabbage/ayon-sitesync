@@ -166,6 +166,245 @@ percent-encoded; a bogus version → 404).
 
 ---
 
+## Added on `luma` (unreleased, 2026-07-19): second-audit fix batch
+
+One batch implementing every actionable finding of the 2026-07-19
+five-agent audit (client resilience, server, UI, upstream, functional
+gaps). No version bump (user bumps explicitly). Mixed rollout is
+tolerated (a new client on an old server treats the missing
+`requeueStale` endpoint as a warn-once), but server and client should
+ship together for the fixes to be complete.
+
+Server (`server/__init__.py`, `settings/settings.py`):
+
+- **SQL injection closed on LIST params.** `SQLTool.array` (ayon-backend)
+  wraps string elements in quotes WITHOUT escaping them — `repreNameFilter`
+  and `siteNames` were live injection points even after the first audit's
+  fixes. **Rule: never call `SQLTool.array` directly on request data —
+  `sql_array` is the one sanctioned IN-list builder (it escapes
+  internally); id lists additionally go through `validate_id_list`,
+  site-name lists through `validate_site_name` per element.**
+- **Folder-ACL on mutating endpoints** (`ensure_representation_access`):
+  state POST/DELETE, `setPriority`, per-repre `resetFailed`; the batch
+  `resetFailed` and `backfill` scope their set operations by
+  `folder_access_list` for restricted users. Unrestricted users and
+  managers are unaffected (no extra query).
+- **`ORDER BY ..., r.id` tiebreaker** in `/state` — all sort keys are
+  non-unique (most rows share priority 50); without a total order, paging
+  skipped/duplicated rows, including in the sync loop's own fetch. Keep it.
+- **`/params` `count` is the raw representation row count again** — the
+  web DataTable uses it as `totalRecords`, and the audit-batch DISTINCT
+  change capped the paginator at one page. `names` stays DISTINCT.
+- **Backfill throttle lives in the DB** (`sitesync_meta` key/value table,
+  created by `check_sync_status_table`): module-level state is per uvicorn
+  worker and reset on deploy, so the anti-join scan ran N× per hour. The
+  claim is one atomic `INSERT ... ON CONFLICT ... WHERE ... RETURNING`.
+- **State POST**: insert branch has `ON CONFLICT DO UPDATE` (FOR UPDATE
+  can't lock a nonexistent row — concurrent first-POSTs 500ed); an
+  explicitly posted `priority` now updates ALL of the repre's rows
+  (a per-side write reintroduced the divergence `setPriority` prevents).
+- **Retry-all is malformed-row-proof**: `CASE WHEN jsonb_typeof(...)`
+  guards `jsonb_each` (AND does not guarantee evaluation order), jsonb
+  equality instead of `::int` casts, `isinstance(files, dict)` in Python.
+- **NEW endpoint `POST /{project}/state/requeueStale?[siteName=]&olderThanSeconds=`**
+  (registered before the generic route): flips IN_PROGRESS files whose
+  timestamp stopped updating back to QUEUED. A tray killed mid-transfer
+  left files IN_PROGRESS forever — the roll-up ranks IN_PROGRESS above
+  everything, the loop fetches only OK/QUEUED pairs, and resetFailed only
+  touches FAILED. Without `siteName` it sweeps EVERY site of the project
+  — deliberately, because a wiped machine's own tray is exactly the one
+  that will never ask for its site; syncing trays call it (no site) per
+  project every 15 min with age 3600. **Clock-skew/mixed-rollout safety:
+  the state POST stamps IN_PROGRESS file timestamps with the SERVER's
+  clock, so staleness is a same-clock comparison regardless of artist
+  machine clocks or older client builds re-posting copied timestamps.
+  The staleness predicate lives in the SQL (CASE-guarded jsonb) so live
+  rows are never fetched or FOR-UPDATE-locked. Companion rule:
+  `update_db` still stamps a fresh int() timestamp on every post — the
+  server model declares `timestamp: int` and float coercion is
+  pydantic-version dependent.**
+- `min_free_space_gb` gained `ge=0` (a negative typo silently disabled
+  the free-space guard).
+
+Client (providers, `sitesync.py`, `addon.py`, plugins):
+
+- **The provider wedge is fixed.** local_drive/sftp ran the copy in a
+  detached thread and size-polled forever; a failed/stalled copy (disk
+  full, VPN drop, OneDrive handle) never surfaced, permanently ate one of
+  the 3 executor slots, and three of them silently halted ALL transfers +
+  hung tray exit. Now: copy threads are daemons with an exception holder;
+  `_mark_progress` raises on thread death or a 300s no-new-bytes stall;
+  sftp `_get_conn` raises instead of returning None. **Rule: no provider
+  wait loop may lack a liveness/stall bound.**
+- **Atomic transfer writes everywhere**: downloads (all providers), sftp
+  uploads (remote tmp + rename) and the workarea mirror write to
+  `*.ayon_tmp` and `os.replace` into place. A truncated file at a final
+  path is trusted by every `os.path.exists` consumer (published tab,
+  CollectAudio, adopt). **Rule: never write transfer bytes directly to
+  the final path.** `sitesync.download` additionally verifies byte size
+  against the representation after every provider download, and
+  `validate_project` refuses to adopt a size-mismatched file.
+- gdrive: HTTP 404/quota-403 now RAISE (returning `False` matched no
+  `update_db` branch — the file retried every pass forever, never counted
+  a retry, never went FAILED, never notified); pause raises
+  `TransferPausedError` (`providers/exceptions.py`), which the loop turns
+  into `update_db(requeue=True)` — a pause is not a failure and must not
+  eat retries. dropbox: real 0-1 progress per chunk (was one `100` post
+  after completion — wrong scale, no visibility). rclone:
+  `_obscure_pass` gates `CREATE_NO_WINDOW` by platform (any web-config
+  password made the provider unusable on macOS/Linux), `lsjson` existence
+  checks get a 60s timeout.
+- **`reset_timer` wakes are never lost**: a wake arriving while a pass is
+  RUNNING used to cancel the previous already-finished timer (no-op) and
+  the transfer waited out `loop_delay` anyway — the exact `+ls.0.0.4`
+  symptom resurfacing under overlap. `_reset_requested` survives the pass
+  and skips the next wait.
+- The results loop posts per-file with containment (one failed status
+  POST no longer drops the rest of the batch's results);
+  `check_shutdown` contains task exceptions (it is also the only shutdown
+  path); the REST wake POST is fire-and-forget in a daemon thread — NOT
+  throttled (a dropped wake can cost a full `loop_delay` for a record
+  written just after the previous pass fetched) and NOT blocking (a hung
+  tray webserver used to add 2s per add_site to a publish).
+- Launch hook: the blocking workfile wait has a 20-min wall-clock ceiling
+  (`max_retries` only counts FAILED attempts — with no tray running the
+  artist was stuck in the launch dialog forever).
+- **Integrator**: a version-overwrite republish now force-requeues the
+  OTHER sites' records too (`_reset_other_site_records`, mirroring the
+  hero handling) — remote machines used to keep stale bytes reading
+  "Synced" forever over regenerated file ids.
+- `_remember_linked` marks ids only after the batched state fetch
+  succeeds and hard-caps the cache; `task_tracking` prunes via
+  read-merge-write and writes atomically.
+
+Control panel (`tray_control_window.py`):
+
+- **`_fetch_state_pages` exists now** — commit `325d832` shipped the call
+  without the function, so "Clean up superseded versions" always
+  NameErrored per project (swallowed) and reported "Nothing to clean up".
+  The helper RAISES on non-200. **Rule: scan helpers must raise on fetch
+  failure so it can never read as an empty (successful) result.**
+- **Download guard requires `remote == OK`** — offering Download on a
+  remote-NA row minted the QUEUED/NA invisible-forever pair AND
+  permanently disqualified the repre from the zero-record backfill.
+- Fetch failures render as "Couldn't reach the server", never as
+  "everything is in sync"; action results/errors stay on the status label
+  for 10s (the immediate refresh used to clobber them within a second).
+- Files tab fetches carry a generation counter — project/filter/page
+  changes invalidate in-flight fetches and refetch, so stale rows are
+  never rendered under a new selection.
+- "Download my renders" scans first (`collect_my_render_downloads`),
+  shows a size-totaled confirm dialog (details behind "Show Details..."),
+  queues only on Yes; it also honors the GLOBAL pause now.
+- Cleanup re-validates every entry (both sides still OK) in one batched
+  call per project right before deleting, reports skipped entries, and
+  counts only actual removals ("freed up to"); no dialog pops after the
+  window was closed.
+- The "Paused" filter matches session-paused rows (client-side merge —
+  the in-memory pause never writes the PAUSED DB status); menu tooltips
+  are visible (`setToolTipsVisible`); the doctor's hidden-override bubble
+  is aggregated into one; "Adopt existing local files" and the web-page
+  button do their REST off the UI thread.
+
+Frontend:
+
+- `updateSite` builds a fresh params object and the fetch effect depends
+  on the selected sites — switching a site dropdown actually refetches
+  (mutating module-level `defaultParams` was a same-reference state
+  update React bailed on).
+- Every user-influenced query value is `encodeURIComponent`ed (site
+  names with spaces, `&`/`#`/`+`/`%` in filters silently corrupted the
+  query); `detail.jsx`'s no-data branch returns (it fell through and
+  threw); load/retry failures surface an error message instead of
+  looking identical to success.
+
+### Review round (2026-07-19, applied on top of the batch)
+
+An 8-angle adversarial review of the batch's own diff surfaced bugs in
+the new code plus cleanups; all were applied:
+
+- **`providers/transfer_utils.py` (NEW FILE) + `providers/exceptions.py`
+  (NEW FILE) — both must be `git add`ed with the batch**: an
+  unconditional module-level import chain reaches them from
+  `sitesync.py` and `gdrive.py`, so committing without them ships a
+  client that ImportErrors at tray init (the documented silent
+  total-failure mode). `transfer_utils` holds the shared transfer
+  machinery: `make_tmp_path` (UNIQUE per-attempt temp names — a stalled
+  attempt's abandoned writer may still hold its file, and a retry
+  reusing a fixed `.ayon_tmp` name would interleave two writers into
+  one torn file), `cleanup_tmp`, `STALL_TIMEOUT`, and
+  `wait_for_transfer` (the one poll loop for local_drive AND sftp).
+- **`wait_for_transfer` RETURNS on clean worker exit** instead of
+  raising "died before completing" — the sftp worker renames the temp
+  file away the instant `put()` returns, so a fast upload could
+  complete without the poll ever observing convergence and was being
+  marked FAILED despite succeeding. **Rule: the poll never judges the
+  outcome; the CALLER verifies the final path** (sftp upload stats
+  `target_path`; downloads compare sizes before `os.replace`).
+  local_drive joins the copy thread 60s and refuses to `os.replace`
+  while it is still alive (OneDrive/AV filter drivers hold the handle
+  past the last byte; replacing then deleted a fully-copied temp file).
+- **gdrive quota-403 raises `TransientTransferError`** (new class):
+  requeued with NO retry increment, like a pause — the first version
+  raised plainly, so a day of quota exhaustion burned files into
+  permanent FAILED, and its retained `sleep(60)` pinned an executor
+  slot. **Rule: transient conditions (pause, quota, rate limit) must
+  never consume `retry_cnt`.**
+- **The wake is an `asyncio.Event`** (created in `run()` on the
+  thread's loop, set via `call_soon_threadsafe`, awaited with
+  `wait_for(timeout=loop_delay)`) — the boolean-flag version still had
+  a lost-wake window between the flag check and the wait start.
+  `run_timer`/`self.timer` are gone; do not reintroduce a cancel-a-task
+  wake.
+- **`add_site` refuses to mint the QUEUED/NA pair at the API level**:
+  when `follow_links is None` (the discriminator for EXTERNAL callers —
+  core's Loader/Scene Inventory cannot pass it; every internal caller
+  passes it explicitly per the existing invariant) and the request is
+  QUEUED, a target-NA-with-source-not-OK add raises ValueError. The
+  control-panel menu guard remains as UX; the publish integrator
+  (explicit `status`) is exempt by construction. The launch hook wraps
+  its linked-repre adds per-repre so a refused dependency cannot break
+  a launch.
+- **`queue_render_downloads` re-applies every gate at commitment time**
+  (global+project pause, `enable_auto_download`, free space, and
+  re-validation through `_queueable_states` — now the SINGLE
+  implementation of the remote-OK/local-NA queueability rule, also used
+  by the periodic path and the scan). The confirm dialog can sit open
+  indefinitely; scan-time gates alone were bypassable.
+- Server: `/params` runs ONE aggregate query (`COUNT(*)` +
+  `array_agg(DISTINCT ...)`); the backfill claim binds bigints (asyncpg
+  REJECTS Python floats for `::numeric` — the endpoint 500ed on every
+  call); the in-process backfill throttle dict is gone (the
+  `sitesync_meta` claim is the single source of truth); backfill's
+  hierarchy join is built only when a folder ACL applies; the state
+  POST's all-rows priority write is `IS DISTINCT FROM`-guarded; the ACL
+  join text lives once in `acl_repre_subquery`.
+- `update_db`: `if priority:` → `is not None` (an explicit priority 0 —
+  documented as valid — was silently dropped).
+- Integrator `_reset_other_site_records`: per-record containment (one
+  failing site no longer abandons the remaining requeues).
+- Control panel: the "Paused" filter fetches the session-paused ids
+  EXACTLY via `addon.get_paused_representations()` +
+  `_get_repres_state` (an unfiltered page missed paused rows sorting
+  past the page boundary) and merges genuinely DB-paused rows;
+  `_collect_queue_rows` pages through `_fetch_state_pages`; "in flight"
+  for file fetches is derived (`seq != applied_seq`, no separate
+  boolean); `_set_status(message, sticky=True)` is the one way to write
+  the status label (terminal action messages are sticky, transient
+  notes are not); the renders confirm flow checks `isVisible()` like
+  the cleanup flow.
+
+**NOT implemented (need design, listed in the audit as follow-ups):**
+event-driven server service (representation-created handler instead of
+backfill polling), orphaned-local-bytes tracking (deleted/archived
+entities leave local files invisible to every tool), provider
+progress/pause/resume parity, hash-based (vs size) verification,
+bandwidth limiting / transfer-hours window, site-id collision detection,
+bulk per-project opt-in tooling, cross-project admin dashboard, and
+narrowing `upload()`'s global lock (kept: gdrive folder creation mutates
+a shared tree and unserialized creation is upstream's duplicate-folder
+bug #69).
+
 ## Added on `luma` (unreleased, 2026-07-18): deferred-audit items A/C/D/E/G
 
 Implements five of the seven items deferred from the 2026-07-17 full
