@@ -1,8 +1,10 @@
 import os
+import time
 
 from ayon_core.lib import Logger
 
 from .abstract_provider import AbstractProvider
+from .transfer_utils import make_tmp_path, cleanup_tmp
 
 log = Logger.get_logger("SiteSync-DropboxHandler")
 
@@ -122,6 +124,8 @@ class DropboxHandler(AbstractProvider):
         Returns:
             (boolean)
         """
+        if not self.presets:
+            return False
         return self.presets.get("enabled") and self.dbx is not None
 
     def _path_exists(self, path):
@@ -198,7 +202,23 @@ class DropboxHandler(AbstractProvider):
 
                 commit = dropbox.files.CommitInfo(path=target_path, mode=mode)
 
+                last_tick = 0
                 while f.tell() < file_size:
+                    # Live 0-1 fraction while chunking - a multi-GB
+                    # upload used to report nothing until it finished
+                    # (and then posted 100 where the whole stack expects
+                    # a 0-1 fraction, transiently reading as 10000%).
+                    if time.time() - last_tick >= addon.LOG_PROGRESS_SEC:
+                        last_tick = time.time()
+                        addon.update_db(
+                            project_name=project_name,
+                            new_file_id=None,
+                            file=file,
+                            repre_status=repre_status,
+                            site_name=site_name,
+                            side="remote",
+                            progress=f.tell() / file_size
+                        )
                     if (file_size - f.tell()) <= CHUNK_SIZE:
                         self.dbx.files_upload_session_finish(
                             f.read(CHUNK_SIZE),
@@ -210,16 +230,6 @@ class DropboxHandler(AbstractProvider):
                             cursor.session_id,
                             cursor.offset)
                         cursor.offset = f.tell()
-
-        addon.update_db(
-            project_name=project_name,
-            new_file_id=None,
-            file=file,
-            repre_status=repre_status,
-            site_name=site_name,
-            side="remote",
-            progress=100
-        )
 
         return target_path
 
@@ -261,20 +271,15 @@ class DropboxHandler(AbstractProvider):
                 "File already exists, use 'overwrite' argument"
             )
 
-        if os.path.exists(local_path) and overwrite:
-            os.unlink(local_path)
-
-        self.dbx.files_download_to_file(local_path, source_path)
-
-        addon.update_db(
-            project_name=project_name,
-            new_file_id=None,
-            file=file,
-            repre_status=repre_status,
-            site_name=site_name,
-            side="local",
-            progress=100
-        )
+        # Download to a temp name and replace into place - an interrupted
+        # download must not leave a truncated file at the final path.
+        tmp_path = make_tmp_path(local_path)
+        try:
+            self.dbx.files_download_to_file(tmp_path, source_path)
+            os.replace(tmp_path, local_path)
+        except Exception:
+            cleanup_tmp(tmp_path, log)
+            raise
 
         return os.path.basename(source_path)
 

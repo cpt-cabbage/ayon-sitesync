@@ -10,6 +10,14 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 from ayon_sitesync.utils import time_function, ResumableError
 from ayon_sitesync.providers.abstract_provider import AbstractProvider
+from ayon_sitesync.providers.exceptions import (
+    TransferPausedError,
+    TransientTransferError,
+)
+from ayon_sitesync.providers.transfer_utils import (
+    make_tmp_path,
+    cleanup_tmp,
+)
 
 SCOPES = ["https://www.googleapis.com/auth/drive.metadata.readonly",
           "https://www.googleapis.com/auth/drive.file",
@@ -112,6 +120,8 @@ class GDriveHandler(AbstractProvider):
         Returns:
             (boolean)
         """
+        if not self.presets:
+            return False
         return self.presets.get("enabled") and self.service is not None
 
     def get_roots_config(self, anatomy=None):
@@ -273,7 +283,8 @@ class GDriveHandler(AbstractProvider):
                         repre_status["representationId"],
                         check_parents=True,
                         project_name=project_name):
-                    raise ValueError("Paused during process, please redo.")
+                    raise TransferPausedError(
+                        "Paused during process, please redo.")
                 if status:
                     status_val = float(status.progress())
                 if not last_tick or \
@@ -292,18 +303,29 @@ class GDriveHandler(AbstractProvider):
                 status, response = request.next_chunk()
 
         except errors.HttpError as ex:
+            # 'return False' here used to reach update_db as a falsy
+            # non-exception result that matched NO branch - the file
+            # retried every pass forever without ever counting a retry,
+            # going FAILED or telling anyone. Raise so the normal
+            # failure path (retries, message, notification) applies.
             if ex.resp["status"] == "404":
-                return False
+                raise FileNotFoundError(
+                    "GDrive target for '{}' not found: {}".format(
+                        source_path, ex._get_reason().strip())
+                )
             if ex.resp["status"] == "403":
                 # real permission issue
                 if "has not granted" in ex._get_reason().strip():
                     raise PermissionError(ex._get_reason().strip())
 
-                self.log.warning(
-                    "Forbidden received, hit quota. Injecting 60s delay."
+                # Quota exhaustion heals on its own - it must neither
+                # burn retries into permanent FAILED nor pin an executor
+                # slot with a sleep. The transient error requeues the
+                # file without counting a retry.
+                self.log.warning("Forbidden received, hit quota.")
+                raise TransientTransferError(
+                    "GDrive quota exhausted, will retry later"
                 )
-                time.sleep(60)
-                return False
             raise
         return response["id"]
 
@@ -360,33 +382,45 @@ class GDriveHandler(AbstractProvider):
         request = self.service.files().get_media(fileId=remote_file["id"],
                                                  supportsAllDrives=True)
 
-        with open(local_path + "/" + target_name, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            last_tick = status = response = None
-            status_val = 0
-            while response is None:
-                if addon.is_representation_paused(
-                    repre_status["representationId"],
-                    check_parents=True,
-                    project_name=project_name
-                ):
-                    raise ValueError("Paused during process, please redo.")
-                if status:
-                    status_val = float(status.progress())
-                if not last_tick or \
-                        time.time() - last_tick >= addon.LOG_PROGRESS_SEC:
-                    last_tick = time.time()
-                    self.log.debug("Downloaded %d%%." % int(status_val * 100))
-                    addon.update_db(
-                        project_name=project_name,
-                        new_file_id=None,
-                        file=file,
-                        repre_status=repre_status,
-                        site_name=site_name,
-                        side="local",
-                        progress=status_val
-                    )
-                status, response = downloader.next_chunk()
+        # Write to a temp name and replace into place at the end - a
+        # download killed mid-chunk must not leave a truncated file at
+        # the final path where os.path.exists() consumers trust it.
+        final_path = local_path + "/" + target_name
+        tmp_path = make_tmp_path(final_path)
+        try:
+            with open(tmp_path, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, request)
+                last_tick = status = response = None
+                status_val = 0
+                while response is None:
+                    if addon.is_representation_paused(
+                        repre_status["representationId"],
+                        check_parents=True,
+                        project_name=project_name
+                    ):
+                        raise TransferPausedError(
+                            "Paused during process, please redo.")
+                    if status:
+                        status_val = float(status.progress())
+                    if not last_tick or \
+                            time.time() - last_tick >= addon.LOG_PROGRESS_SEC:
+                        last_tick = time.time()
+                        self.log.debug(
+                            "Downloaded %d%%." % int(status_val * 100))
+                        addon.update_db(
+                            project_name=project_name,
+                            new_file_id=None,
+                            file=file,
+                            repre_status=repre_status,
+                            site_name=site_name,
+                            side="local",
+                            progress=status_val
+                        )
+                    status, response = downloader.next_chunk()
+            os.replace(tmp_path, final_path)
+        except Exception:
+            cleanup_tmp(tmp_path, self.log)
+            raise
 
         return target_name
 

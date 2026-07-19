@@ -1,6 +1,5 @@
 import os
 import os.path
-import time
 import threading
 import platform
 
@@ -18,6 +17,8 @@ except (ImportError, SyntaxError):
 
     # handle imports from Python 2 hosts - in those only basic methods are used
     log.warning("Import failed, imported from Python 2, operations will fail.")
+
+from .transfer_utils import make_tmp_path, cleanup_tmp, wait_for_transfer
 
 
 class SFTPHandler(AbstractProvider):
@@ -72,7 +73,14 @@ class SFTPHandler(AbstractProvider):
         Returns:
             (boolean)
         """
-        return self.presets.get("enabled") and self.conn is not None
+        if not self.presets or not self.presets.get("enabled"):
+            return False
+        try:
+            return self.conn is not None
+        except Exception:
+            # _get_conn raises on connection failure - an unreachable or
+            # misconfigured SFTP site is "not working", not a crash.
+            return False
 
     def get_roots_config(self, anatomy=None):
         """
@@ -155,26 +163,85 @@ class SFTPHandler(AbstractProvider):
                 raise ValueError("File {} exists, set overwrite".
                                  format(target_path))
 
-        thread = threading.Thread(target=self._upload,
-                                  args=(source_path, target_path))
+        remote_tmp = make_tmp_path(target_path)
+        upload_error = {}
+        thread = threading.Thread(
+            target=self._upload,
+            args=(source_path, target_path, remote_tmp, upload_error))
+        thread.daemon = True
         thread.start()
-        self._mark_progress(
-            project_name,
-            file,
-            repre_status,
-            addon,
-            site_name,
-            source_path,
-            target_path,
-            "upload"
+
+        source_size = os.path.getsize(source_path)
+
+        def _post_progress(fraction):
+            self.log.debug(f"uploaded {int(fraction * 100)}%.")
+            addon.update_db(
+                project_name=project_name,
+                new_file_id=None,
+                file=file,
+                repre_status=repre_status,
+                site_name=site_name,
+                side="remote",
+                progress=fraction
+            )
+
+        def _remote_tmp_size():
+            try:
+                return self.conn.stat(remote_tmp).st_size
+            except (FileNotFoundError, IOError, OSError):
+                return None
+
+        wait_for_transfer(
+            source_size,
+            _remote_tmp_size,
+            _post_progress,
+            addon.LOG_PROGRESS_SEC,
+            thread=thread,
+            error_holder=upload_error,
         )
+        # The worker renames the temp file into place the INSTANT put()
+        # returns, so a fast upload can complete without the poll ever
+        # observing convergence (the tmp is already gone). The outcome
+        # is therefore judged on the FINAL path, never on the poll.
+        thread.join(60)
+        if upload_error.get("error"):
+            raise upload_error["error"]
+        if thread.is_alive():
+            raise OSError(
+                "Upload of '{}' did not finalize".format(source_path))
+        try:
+            uploaded_size = self.conn.stat(target_path).st_size
+        except (FileNotFoundError, IOError, OSError):
+            uploaded_size = None
+        if uploaded_size != source_size:
+            raise OSError(
+                "Upload of '{}' produced size {} instead of {}".format(
+                    source_path, uploaded_size, source_size)
+            )
 
         return os.path.basename(target_path)
 
-    def _upload(self, source_path, target_path):
-        print("copying {}->{}".format(source_path, target_path))
-        conn = self._get_conn()
-        conn.put(source_path, target_path)
+    def _upload(self, source_path, target_path, tmp_path, error_holder=None):
+        log.debug("copying {}->{}".format(source_path, target_path))
+        try:
+            conn = self._get_conn()
+            conn.put(source_path, tmp_path)
+            if conn.isfile(target_path):
+                conn.remove(target_path)
+            conn.rename(tmp_path, target_path)
+        except Exception as exc:
+            # The exception must reach the transfer's thread - dying
+            # silently here is what used to wedge the size-poll forever.
+            if error_holder is not None:
+                error_holder["error"] = exc
+            log.warning(
+                "Upload {} -> {} failed".format(source_path, target_path),
+                exc_info=True,
+            )
+            try:
+                conn.remove(tmp_path)
+            except Exception:
+                pass
 
     def download_file(
         self,
@@ -216,26 +283,73 @@ class SFTPHandler(AbstractProvider):
                 raise ValueError("File {} exists, set overwrite".
                                  format(target_path))
 
-        thread = threading.Thread(target=self._download,
-                                  args=(source_path, target_path))
+        local_tmp = make_tmp_path(target_path)
+        download_error = {}
+        thread = threading.Thread(
+            target=self._download,
+            args=(source_path, local_tmp, download_error))
+        thread.daemon = True
         thread.start()
-        self._mark_progress(
-            project_name,
-            file,
-            repre_status,
-            addon,
-            site_name,
-            source_path,
-            target_path,
-            "download"
-        )
+
+        source_size = self.conn.stat(source_path).st_size
+
+        def _post_progress(fraction):
+            self.log.debug(f"downloaded {int(fraction * 100)}%.")
+            addon.update_db(
+                project_name=project_name,
+                new_file_id=None,
+                file=file,
+                repre_status=repre_status,
+                site_name=site_name,
+                side="local",
+                progress=fraction
+            )
+
+        def _local_tmp_size():
+            try:
+                return os.path.getsize(local_tmp)
+            except OSError:
+                return None
+
+        try:
+            wait_for_transfer(
+                source_size,
+                _local_tmp_size,
+                _post_progress,
+                addon.LOG_PROGRESS_SEC,
+                thread=thread,
+                error_holder=download_error,
+            )
+            thread.join(60)
+            if download_error.get("error"):
+                raise download_error["error"]
+            if thread.is_alive():
+                raise OSError(
+                    "Download of '{}' did not finalize".format(source_path))
+            if os.path.getsize(local_tmp) != source_size:
+                raise OSError(
+                    "Download of '{}' produced a size mismatch".format(
+                        source_path)
+                )
+            os.replace(local_tmp, target_path)
+        except Exception:
+            cleanup_tmp(local_tmp, log)
+            raise
 
         return os.path.basename(target_path)
 
-    def _download(self, source_path, target_path):
-        print("downloading {}->{}".format(source_path, target_path))
-        conn = self._get_conn()
-        conn.get(source_path, target_path)
+    def _download(self, source_path, target_path, error_holder=None):
+        log.debug("downloading {}->{}".format(source_path, target_path))
+        try:
+            conn = self._get_conn()
+            conn.get(source_path, target_path)
+        except Exception as exc:
+            if error_holder is not None:
+                error_holder["error"] = exc
+            log.warning(
+                "Download {} -> {} failed".format(source_path, target_path),
+                exc_info=True,
+            )
 
     def delete_file(self, path):
         """
@@ -341,53 +455,14 @@ class SFTPHandler(AbstractProvider):
         except (
             paramiko.ssh_exception.SSHException,
             sftpretty.exceptions.ConnectionException,
-        ):
+        ) as exc:
             self.log.warning("Couldn't connect", exc_info=True)
+            # Returning None here used to make the transfer threads die
+            # instantly on 'conn.put' (AttributeError on None) while the
+            # size-poll spun on 0 bytes forever - a connection failure
+            # must be an exception the caller can turn into FAILED.
+            raise ConnectionError(
+                "SFTP connection to '{}:{}' failed: {}".format(
+                    self.sftp_host, self.sftp_port, exc)
+            )
 
-    def _mark_progress(
-        self,
-        project_name,
-        file,
-        repre_status,
-        server,
-        site_name,
-        source_path,
-        target_path,
-        direction
-    ):
-        """Updates progress field in DB by values 0-1.
-
-        Compares file sizes of source and target.
-        """
-        pass
-        if direction == "upload":
-            side = "remote"
-            source_file_size = os.path.getsize(source_path)
-        else:
-            side = "local"
-            source_file_size = self.conn.stat(source_path).st_size
-
-        target_file_size = 0
-        last_tick = 0
-        while source_file_size != target_file_size:
-            if time.time() - last_tick >= server.LOG_PROGRESS_SEC:
-                status_val = target_file_size / source_file_size
-                last_tick = time.time()
-                self.log.debug(f"{direction}ed {int(status_val * 100)}%.")
-                server.update_db(
-                    project_name=project_name,
-                    new_file_id=None,
-                    file=file,
-                    repre_status=repre_status,
-                    site_name=site_name,
-                    side=side,
-                    progress=status_val
-                )
-            try:
-                if direction == "upload":
-                    target_file_size = self.conn.stat(target_path).st_size
-                else:
-                    target_file_size = os.path.getsize(target_path)
-            except FileNotFoundError:
-                pass
-            time.sleep(0.5)

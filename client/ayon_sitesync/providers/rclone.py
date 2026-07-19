@@ -8,6 +8,7 @@ import subprocess
 from typing import TYPE_CHECKING
 
 from .abstract_provider import AbstractProvider
+from .transfer_utils import make_tmp_path, cleanup_tmp
 
 if TYPE_CHECKING:
     from ayon_sitesync.addon import SiteSyncAddon
@@ -183,11 +184,18 @@ class RCloneHandler(AbstractProvider):
             )
 
         source_path = self._get_remote_path(source_path)
-        args = ["copyto", source_path, local_path]
-        if not overwrite:
-            args.append("--ignore-existing")
+        # Download to a temp name and replace into place - an interrupted
+        # rclone copy must not leave a truncated file at the final path
+        # (existence was already checked above for the no-overwrite case).
+        tmp_path = make_tmp_path(local_path)
+        args = ["copyto", source_path, tmp_path]
 
-        self._run_rclone(args)
+        try:
+            self._run_rclone(args)
+            os.replace(tmp_path, local_path)
+        except Exception:
+            cleanup_tmp(tmp_path, self.log)
+            raise
 
         if addon:
             self.log.debug(
@@ -284,8 +292,13 @@ class RCloneHandler(AbstractProvider):
             env["RCLONE_CONFIG"] = null_device
         return env
 
-    def _run_rclone(self, args: list[str]) -> str:
-        """Internal helper to execute rclone commands with extra args."""
+    def _run_rclone(self, args: list[str], timeout: int = None) -> str:
+        """Internal helper to execute rclone commands with extra args.
+
+        'timeout' (seconds) is for quick metadata operations only - a
+        genuine transfer may legitimately run for hours and must not be
+        bounded here.
+        """
         cmd = [self.rclone_path]
         if self.config_path:
             cmd.extend(["--config", self.config_path])
@@ -309,6 +322,7 @@ class RCloneHandler(AbstractProvider):
             env=env,
             text=True,
             check=False,
+            timeout=timeout,
             **kwargs,
         )
 
@@ -331,7 +345,9 @@ class RCloneHandler(AbstractProvider):
         remote_path = self._get_remote_path(path)
         args = ["lsjson", remote_path]
         try:
-            output = self._run_rclone(args)
+            # A hung remote must not block the sync thread indefinitely
+            # on a mere existence check.
+            output = self._run_rclone(args, timeout=60)
             if not output:
                 return False
 
@@ -361,11 +377,18 @@ class RCloneHandler(AbstractProvider):
         # Rclone expects passwords in env vars to be obscured
         # You can call 'rclone obscure' via subprocess to get this string
         cmd = [self.rclone_path, "obscure", password]
+        # CREATE_NO_WINDOW exists only on Windows Python - passing it
+        # unconditionally raised AttributeError on macOS/Linux before the
+        # subprocess even ran, making any web-config site with a password
+        # permanently "not working" on POSIX.
+        kwargs = {}
+        if platform.system().lower() == "windows":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             output = subprocess.check_output(
                 cmd,
                 stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                **kwargs,
             )
             return output.decode().strip()
         except FileNotFoundError as e:

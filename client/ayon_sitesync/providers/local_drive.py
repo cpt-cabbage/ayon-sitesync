@@ -7,6 +7,7 @@ import time
 from ayon_core.lib import Logger
 from ayon_core.pipeline import Anatomy
 from .abstract_provider import AbstractProvider
+from .transfer_utils import make_tmp_path, cleanup_tmp, wait_for_transfer
 
 from ayon_core.addon import AddonsManager
 
@@ -121,19 +122,73 @@ class LocalDriveHandler(AbstractProvider):
                                     .format(source_path))
 
         if overwrite:
-            thread = threading.Thread(target=self._copy,
-                                      args=(source_path, target_path))
-            thread.start()
-            self._mark_progress(
-                project_name,
-                file,
-                representation,
-                server,
-                site,
-                source_path,
-                target_path,
-                direction
+            # Unique per-attempt temp name: a stalled attempt's abandoned
+            # writer may still hold its own temp file; a retry must never
+            # share a path with it (see transfer_utils.make_tmp_path).
+            tmp_path = make_tmp_path(target_path)
+            copy_error = {}
+            # Daemon: an abandoned copy stuck on a dead share must not
+            # keep the tray from exiting.
+            thread = threading.Thread(
+                target=self._copy,
+                args=(source_path, tmp_path, copy_error),
             )
+            thread.daemon = True
+            thread.start()
+
+            side = "local"
+            if direction == "Upload":
+                side = "remote"
+
+            def _post_progress(fraction):
+                log.debug(direction + "ed %d%%." % int(fraction * 100))
+                server.update_db(
+                    project_name=project_name,
+                    new_file_id=None,
+                    file=file,
+                    repre_status=representation,
+                    site_name=site,
+                    side=side,
+                    progress=fraction
+                )
+
+            def _tmp_size():
+                try:
+                    return os.path.getsize(tmp_path)
+                except OSError:
+                    return None
+
+            try:
+                wait_for_transfer(
+                    os.path.getsize(source_path),
+                    _tmp_size,
+                    _post_progress,
+                    server.LOG_PROGRESS_SEC,
+                    thread=thread,
+                    error_holder=copy_error,
+                )
+                # The copy thread may still be flushing/closing the
+                # handle after the last byte lands (OneDrive/AV filter
+                # drivers hold it) - replacing a file another thread
+                # still holds open fails on Windows and used to delete
+                # a fully-copied temp file.
+                thread.join(60)
+                if copy_error.get("error"):
+                    raise copy_error["error"]
+                if thread.is_alive():
+                    raise OSError(
+                        "{} of '{}' did not finalize".format(
+                            direction, source_path)
+                    )
+                if os.path.getsize(tmp_path) != os.path.getsize(source_path):
+                    raise OSError(
+                        "{} of '{}' produced a size mismatch".format(
+                            direction, source_path)
+                    )
+                os.replace(tmp_path, target_path)
+            except Exception:
+                cleanup_tmp(tmp_path, log)
+                raise
         else:
             if os.path.exists(target_path):
                 raise ValueError("File {} exists, set overwrite".
@@ -228,55 +283,21 @@ class LocalDriveHandler(AbstractProvider):
     def get_tree(self):
         return
 
-    def _copy(self, source_path, target_path):
-        print("copying {}->{}".format(source_path, target_path))
+    def _copy(self, source_path, target_path, error_holder=None):
+        log.debug("copying {}->{}".format(source_path, target_path))
         try:
             shutil.copy(source_path, target_path)
         except shutil.SameFileError:
-            print("same files, skipping")
-
-    def _mark_progress(
-        self,
-        project_name,
-        file,
-        repre_status,
-        server,
-        site_name,
-        source_path,
-        target_path,
-        direction
-    ):
-        """
-            Updates progress field in DB by values 0-1.
-
-            Compares file sizes of source and target.
-        """
-        source_file_size = os.path.getsize(source_path)
-        target_file_size = 0
-        last_tick = status_val = None
-        side = "local"
-        if direction == "Upload":
-            side = "remote"
-        while source_file_size != target_file_size:
-            if not last_tick or \
-                    time.time() - last_tick >= server.LOG_PROGRESS_SEC:
-                status_val = target_file_size / source_file_size
-                last_tick = time.time()
-                log.debug(direction + "ed %d%%." % int(status_val * 100))
-                server.update_db(
-                    project_name=project_name,
-                    new_file_id=None,
-                    file=file,
-                    repre_status=repre_status,
-                    site_name=site_name,
-                    side=side,
-                    progress=status_val
-                )
-            try:
-                target_file_size = os.path.getsize(target_path)
-            except FileNotFoundError:
-                pass
-            time.sleep(0.5)
+            log.debug("same files, skipping")
+        except Exception as exc:
+            # The exception must reach the transfer's thread - dying
+            # silently here is what used to wedge the size-poll forever.
+            if error_holder is not None:
+                error_holder["error"] = exc
+            log.warning(
+                "Copy {} -> {} failed".format(source_path, target_path),
+                exc_info=True,
+            )
 
     def _normalize_site_name(self, site_name):
         """Transform user id to 'local' for Local settings"""
