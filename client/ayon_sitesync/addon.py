@@ -256,6 +256,20 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         if not site_name:
             site_name = self.DEFAULT_SITE
 
+        # External transfer requests (core's Loader / Scene Inventory -
+        # the only callers that cannot pass 'follow_links') must never
+        # mint the QUEUED/NA pair: a QUEUED record whose opposite pair
+        # side holds no complete copy is a transfer the sync loop can
+        # never match, AND the repre then HAS a row, permanently
+        # disqualifying it from the zero-record backfill. Internal
+        # callers pass 'follow_links' explicitly and enforce their own
+        # rules (the publish integrator legitimately creates QUEUED
+        # records before the opposite side exists).
+        if follow_links is None and status == SiteSyncStatus.QUEUED:
+            self._ensure_transfer_source_ok(
+                project_name, representation_id, site_name
+            )
+
         representation = self._add_site_record(
             project_name, representation_id, site_name,
             file_id, force, status, priority
@@ -285,6 +299,55 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         # transfer even started. `reset_timer` works cross-process: from a DCC
         # it POSTs to the tray's webserver. It is best-effort and never raises.
         self.reset_timer()
+
+    def _ensure_transfer_source_ok(
+        self, project_name, representation_id, site_name
+    ):
+        """Refuse an external transfer whose source side is incomplete.
+
+        Best-effort: any resolution or state-fetch problem allows the
+        request (this guard must never break a legitimate flow), but a
+        POSITIVE finding - the target side has no record while the
+        opposite side is not fully synced - raises ValueError with an
+        actionable message instead of silently creating the documented
+        invisible-forever pair.
+        """
+        try:
+            active_site = self.get_active_site(project_name)
+            remote_site = self.get_remote_site(project_name)
+        except Exception:
+            return
+        if (
+            active_site == remote_site
+            or site_name not in (active_site, remote_site)
+        ):
+            # degenerate pair or an alternate site outside the pair -
+            # there is no opposite side to check
+            return
+        if site_name == active_site:
+            target_key, source_key = "localStatus", "remoteStatus"
+        else:
+            target_key, source_key = "remoteStatus", "localStatus"
+        try:
+            states = self._get_repres_state(
+                project_name, [representation_id], active_site, remote_site
+            )
+        except Exception:
+            return
+        for state in states:
+            if state[target_key]["status"] != SiteSyncStatus.NA:
+                # an existing record - this is a reset/retry, not a new
+                # transfer request
+                return
+            if state[source_key]["status"] == SiteSyncStatus.OK:
+                return
+            raise ValueError(
+                "Cannot queue a transfer of representation {} to site"
+                " '{}': the opposite site holds no complete copy to"
+                " transfer from. Sync it there first (or wait for the"
+                " publish/backfill to finish).".format(
+                    representation_id, site_name)
+            )
 
     def _add_site_record(
         self, project_name, representation_id, site_name,
@@ -367,6 +430,13 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             for key in list(cache):
                 if cache[key] < cutoff:
                     del cache[key]
+            # A burst of live (unexpired) keys must not grow unbounded -
+            # drop the oldest beyond a hard cap; worst case is one early
+            # link re-traversal, which the state checks make harmless.
+            if len(cache) > 4000:
+                overflow = len(cache) - 2000
+                for key in sorted(cache, key=cache.get)[:overflow]:
+                    del cache[key]
         for repre_id in repre_ids:
             key = (project_name, site_name, str(repre_id).replace("-", ""))
             cache[key] = now
@@ -429,7 +499,6 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             ]
             if not linked_ids:
                 return
-            self._remember_linked(project_name, site_name, linked_ids)
 
             if site_name == active_site:
                 target_key, source_key = "localStatus", "remoteStatus"
@@ -439,6 +508,10 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             states = self._get_repres_state(
                 project_name, linked_ids, active_site, remote_site
             )
+            # Remember only AFTER the state fetch succeeded - marking
+            # first would suppress the user's immediate retry for the
+            # whole TTL when the fetch failed.
+            self._remember_linked(project_name, site_name, linked_ids)
             for state in states:
                 link_repre_id = state["representationId"]
                 if state[target_key]["status"] != SiteSyncStatus.NA:
@@ -563,6 +636,21 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         Returns:
             int: Number of newly queued representations.
         """
+        return self._get_auto_downloader().download_renders()
+
+    def collect_my_render_downloads(self):
+        """Scan what 'download_my_renders' would queue, with sizes.
+
+        Lets the control panel show the total size and confirm before
+        committing - renders are the heaviest data the addon can pull.
+        """
+        return self._get_auto_downloader().collect_render_downloads()
+
+    def queue_my_render_downloads(self, entries):
+        """Queue previously scanned render downloads."""
+        return self._get_auto_downloader().queue_render_downloads(entries)
+
+    def _get_auto_downloader(self):
         # reuse the sync thread's downloader when it exists so
         # session-scoped state (warn-once dedup, username cache) is
         # shared with the periodic loop; fall back to a fresh instance
@@ -572,7 +660,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             from .auto_download import AutoDownloader
 
             downloader = AutoDownloader(self)
-        return downloader.download_renders()
+        return downloader
 
     def backfill_missing_site_records(self, project_name, site_name=None):
         """Stamp available-on-source on repres with no site records at all.
@@ -593,26 +681,61 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         Returns:
             int: Number of representations backfilled.
         """
-        from urllib.parse import quote
-
         if not site_name:
             site_name = (
                 self.get_remote_site(project_name) or self.DEFAULT_SITE
             )
-        # query params must live in the URL: ayon_api.post sends kwargs
-        # as the JSON body
-        endpoint = "{}/{}/state/backfill?siteName={}".format(
-            self.endpoint_prefix, project_name, quote(str(site_name))
+        return self._post_state_action(
+            project_name,
+            "backfill",
+            {"siteName": site_name},
+            "backfilledCount",
+        )
+
+    def requeue_stale_transfers(
+        self, project_name, site_name=None, older_than_seconds=3600
+    ):
+        """Requeue IN_PROGRESS files whose updates stopped (dead tray).
+
+        A tray killed mid-transfer leaves files IN_PROGRESS forever: the
+        roll-up ranks IN_PROGRESS above everything and the sync loop only
+        fetches OK/QUEUED pairs, so nothing else ever un-sticks them.
+        Without 'site_name' the server sweeps EVERY site of the project -
+        which is the point: a wiped machine's own tray is exactly the one
+        that will never ask for its site. Safe any time: the server
+        stamps its own clock on IN_PROGRESS files and a live transfer
+        refreshes it every few seconds.
+
+        Returns:
+            int: Number of representations whose files were requeued.
+        """
+        params = {"olderThanSeconds": int(older_than_seconds)}
+        if site_name:
+            params["siteName"] = site_name
+        return self._post_state_action(
+            project_name, "requeueStale", params, "requeuedCount"
+        )
+
+    def _post_state_action(self, project_name, action, params, count_key):
+        """POST a state maintenance action endpoint, return its count.
+
+        Query params must live in the URL: ayon_api.post sends kwargs as
+        the JSON body.
+        """
+        from urllib.parse import urlencode
+
+        endpoint = "{}/{}/state/{}?{}".format(
+            self.endpoint_prefix, project_name, action, urlencode(params)
         )
         response = ayon_api.post(endpoint)
         if response.status_code not in [200, 204]:
             raise RuntimeError(
-                "Backfill of site records failed for '{}' with {}".format(
-                    project_name, response.status_code
+                "State action '{}' failed for '{}' with {}".format(
+                    action, project_name, response.status_code
                 )
             )
         data = response.data or {}
-        return int(data.get("backfilledCount") or 0)
+        return int(data.get(count_key) or 0)
 
     def compute_resource_sync_sites(self, project_name):
         """Get available resource sync sites state for publish process.
@@ -879,6 +1002,25 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 file_exists = (
                     local_file_path and os.path.exists(local_file_path)
                 )
+                # Adopt only files whose size matches the published one -
+                # a truncated leftover of a killed download would
+                # otherwise be marked OK forever and the loop would never
+                # re-fetch it. A mismatched file counts as missing.
+                if file_exists:
+                    expected_size = repre_file.get("size")
+                    if expected_size:
+                        try:
+                            actual_size = os.path.getsize(local_file_path)
+                        except OSError:
+                            actual_size = None
+                        if actual_size != expected_size:
+                            self.log.warning(
+                                "Not adopting '{}' - size {} does not"
+                                " match published size {}".format(
+                                    local_file_path, actual_size,
+                                    expected_size)
+                            )
+                            file_exists = False
                 current_status = status_by_file_id.get(
                     repre_file["id"], SiteSyncStatus.NA
                 )
@@ -1009,6 +1151,15 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                 or self.is_paused()
             )
         return is_paused
+
+    def get_paused_representations(self):
+        """Copy of the session-paused representation ids.
+
+        The pause is in-memory only (never written to the DB), so UIs
+        that want to LIST paused representations cannot ask the server -
+        this is the one sanctioned accessor.
+        """
+        return set(self._paused_representations)
 
     # TODO hook to some trigger - no Sync Queue anymore
     def pause_project(self, project_name):
@@ -1382,7 +1533,14 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         return status["status"] == SiteSyncStatus.OK
 
     def _reset_timer_with_rest_api(self):
-        # POST to webserver sites to add to representations
+        # POST to the tray webserver's reset route. Fire-and-forget in a
+        # daemon thread: the publish integrator calls add_site once per
+        # representation per site, and each POST used to BLOCK for up to
+        # its 2s timeout - with a hung tray a 30-repre x 2-site publish
+        # gained ~2 minutes of dead waiting. (A throttle is the wrong
+        # fix: a dropped wake can cost a full loop_delay for a record
+        # written just after the previous pass fetched - the exact
+        # +ls.0.0.4 symptom.)
         webserver_url = os.environ.get("AYON_WEBSERVER_URL")
         if not webserver_url:
             self.log.warning("Couldn't find webserver url")
@@ -1391,7 +1549,13 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         rest_api_url = "{}/sitesync/reset_timer".format(
             webserver_url
         )
+        thread = threading.Thread(
+            target=self._post_reset_timer, args=(rest_api_url,)
+        )
+        thread.daemon = True
+        thread.start()
 
+    def _post_reset_timer(self, rest_api_url):
         try:
             import requests
         except Exception:
@@ -1839,8 +2003,15 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
 
         Runs through the sync thread's 'long_running_tasks' queue so the
         (potentially long) whole-project scan doesn't block the UI or a
-        sync pass.
+        sync pass. The scheduling itself needs one settings fetch per
+        project (get_enabled_projects/get_active_site) - REST on the UI
+        thread freezes the tray, so even that runs in a worker.
         """
+        thread = threading.Thread(target=self._schedule_validate_projects)
+        thread.daemon = True
+        thread.start()
+
+    def _schedule_validate_projects(self):
         try:
             local_site = get_local_site_id()
             scheduled = []
@@ -1872,7 +2043,11 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                     "No project to check - this machine is not an active"
                     " local site for any enabled project."
                 )
-            self.show_tray_message("Site Sync", message)
+            self.execute_in_main_thread(
+                functools.partial(
+                    self.show_tray_message, "Site Sync", message
+                )
+            )
         except Exception:
             self.log.warning(
                 "Couldn't schedule local files validation", exc_info=True
@@ -1889,6 +2064,13 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             )
 
     def _on_tray_open_web(self):
+        # REST on the UI thread freezes the tray - resolve the project
+        # page (settings fetches) and open the browser in a worker.
+        thread = threading.Thread(target=self._open_web_page)
+        thread.daemon = True
+        thread.start()
+
+    def _open_web_page(self):
         import webbrowser
 
         url = ayon_api.get_base_url()
@@ -1960,6 +2142,7 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
            bubble explains how to opt back in.
         """
         idle_projects = []
+        trap_projects = []
         try:
             for project_name in get_project_names():
                 try:
@@ -1974,22 +2157,12 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                         use_site=True
                     )
                     if not site_level.get("enabled"):
-                        message = (
+                        self.log.warning(
                             "Site Sync is ON for project '{}' but a hidden"
-                            " override disables it for this machine - nothing"
-                            " will sync here. Ask your admin to delete the"
-                            " 'enabled' override for your site (see the"
-                            " deployment-trap note in the Site Sync docs)."
-                        ).format(project_name)
-                        self.log.warning(message)
-                        if getattr(self, "tray_initialized", False):
-                            self.execute_in_main_thread(
-                                functools.partial(
-                                    self.show_tray_message,
-                                    "Site Sync",
-                                    message
-                                )
-                            )
+                            " override disables it for this machine -"
+                            " nothing will sync here.".format(project_name)
+                        )
+                        trap_projects.append(project_name)
                         continue
 
                     if (
@@ -2001,6 +2174,23 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
                     continue
         except Exception:
             self.log.warning("Site Sync doctor check failed", exc_info=True)
+
+        if trap_projects:
+            # ONE aggregated bubble - a per-project popup storm at tray
+            # start would just get dismissed unread.
+            message = (
+                "Site Sync is ON for project(s) {} but a hidden override"
+                " disables it for this machine - nothing will sync here."
+                " Ask your admin to delete the 'enabled' override for"
+                " your site (see the deployment-trap note in the Site"
+                " Sync docs)."
+            ).format(", ".join("'{}'".format(name) for name in trap_projects))
+            if getattr(self, "tray_initialized", False):
+                self.execute_in_main_thread(
+                    functools.partial(
+                        self.show_tray_message, "Site Sync", message
+                    )
+                )
 
         if idle_projects:
             self._notify_not_opted_in(idle_projects)
@@ -2439,7 +2629,8 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
         error=None,
         progress=None,
         priority=None,
-        pause=None
+        pause=None,
+        requeue=None
     ):
         """Update 'provider' portion of records in DB.
 
@@ -2456,6 +2647,9 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             priority (int): 0-100 set priority
             pause (bool): stop synchronizing (only before starting of download,
                 upload)
+            requeue (bool): put the file back to QUEUED without counting a
+                retry or storing an error - used when a transfer is
+                interrupted deliberately (artist paused it mid-file)
 
         Returns:
             None
@@ -2472,10 +2666,23 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             # OK when only one was actually transferred - the twin was
             # never copied yet read as synced.
             if file_status["id"] == file["id"]:
+                # Every event stamps a FRESH timestamp: the server-side
+                # stale-transfer requeue distinguishes a live transfer
+                # from a dead tray purely by how old the last update is,
+                # so re-posting the copied (old) timestamp would make a
+                # genuinely moving file look dead - and vice versa.
+                # int(): the server model declares 'timestamp: int' and
+                # float coercion is pydantic-version dependent.
+                status_entity["timestamp"] = int(
+                    datetime.now().timestamp()
+                )
                 if new_file_id:
                     status_entity["status"] = SiteSyncStatus.OK
                     status_entity.pop("message")
                     status_entity.pop("retries")
+                elif requeue:
+                    status_entity["status"] = SiteSyncStatus.QUEUED
+                    status_entity.pop("progress", None)
                 elif progress is not None:
                     status_entity["status"] = SiteSyncStatus.IN_PROGRESS
                     status_entity["progress"] = progress
@@ -2517,14 +2724,16 @@ class SiteSyncAddon(AYONAddon, ITrayAddon, IPluginPaths):
             "files": files_status
         }
 
-        if priority:
+        # 'is not None': priority 0 is a valid value (deprioritize to the
+        # back of the queue) and a falsy check silently dropped it
+        if priority is not None:
             kwargs["priority"] = priority
 
         response = ayon_api.post(endpoint, **kwargs)
         if response.status_code not in [200, 204]:
             raise RuntimeError("Cannot update status")
 
-        if progress is not None or priority is not None:
+        if progress is not None or priority is not None or requeue:
             return
 
         status = "failed"
