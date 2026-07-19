@@ -40,6 +40,7 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
         published_sites = sitesync_addon.compute_resource_sync_sites(
             project_name=project_name
         )
+        overwritten_repre_ids = set()
         for repre_id, inst in published_representations.items():
             for site_info in published_sites:
                 try:
@@ -76,6 +77,15 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
                         force=True,
                         follow_links=False,
                     )
+                    overwritten_repre_ids.add(repre_id)
+
+        if overwritten_repre_ids:
+            self._reset_other_site_records(
+                project_name,
+                sitesync_addon,
+                overwritten_repre_ids,
+                published_sites
+            )
 
         hero_version_entity = instance.data.get("heroVersionEntity")
         self.log.info(f"hero_version_entity::{hero_version_entity}")
@@ -88,6 +98,61 @@ class IntegrateSiteSync(pyblish.api.InstancePlugin):
             hero_version_entity,
             published_sites
         )
+
+    def _reset_other_site_records(
+        self,
+        project_name: str,
+        sitesync_addon: AYONAddon,
+        repre_ids,
+        published_sites: list[dict]
+    ) -> None:
+        """Requeue OTHER machines' records after a version overwrite.
+
+        Publishing into an existing version keeps representation ids but
+        regenerates file ids, so EVERY site record now points at dead
+        file ids - not only the publishing machine's set (which the
+        force retry above already rebuilt). A remote artist who had the
+        old version downloaded used to keep a roll-up of OK over the
+        stale ids: everything read "Synced" while the machine held the
+        previous publish's bytes, forever. Mirrors the hero handling:
+        enumerate all existing records and force-requeue the ones the
+        publish didn't rewrite. Best-effort - never fails the publish.
+        """
+        try:
+            published_names = {site["name"] for site in published_sites}
+            states = sitesync_addon.get_representations_sites_sync_state(
+                project_name, list(repre_ids)
+            )
+        except Exception:
+            self.log.warning(
+                "Couldn't list sites' records after a version overwrite",
+                exc_info=True
+            )
+            return
+        for repre_site in states:
+            if repre_site["siteName"] in published_names:
+                continue
+            # per-record containment: one failing site must not abandon
+            # the requeue of every remaining record - each one left
+            # behind keeps a roll-up of OK over dead file ids
+            try:
+                sitesync_addon.add_site(
+                    project_name,
+                    repre_site["representationId"],
+                    repre_site["siteName"],
+                    status=SiteSyncStatus.QUEUED,
+                    force=True,
+                    follow_links=False,
+                )
+            except Exception:
+                self.log.warning(
+                    "Couldn't requeue site '{}' of representation '{}'"
+                    " after a version overwrite".format(
+                        repre_site["siteName"],
+                        repre_site["representationId"],
+                    ),
+                    exc_info=True
+                )
 
     def _reset_hero_representations(
         self,

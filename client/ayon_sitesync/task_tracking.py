@@ -47,8 +47,12 @@ def _save(content):
     try:
         path = _get_tracked_file_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as stream:
+        # atomic write: concurrent writers (tray prune vs DCC record)
+        # may lose an update to each other, but never tear the file
+        tmp_path = "{}.tmp.{}".format(path, os.getpid())
+        with open(tmp_path, "w") as stream:
             json.dump(content, stream)
+        os.replace(tmp_path, path)
     except Exception:
         log.warning("Couldn't save tracked tasks file", exc_info=True)
 
@@ -102,12 +106,35 @@ def get_tracked_tasks(project_name, retention_days):
             expired.append(task_id)
 
     if expired:
-        for task_id in expired:
-            project_tasks.pop(task_id, None)
-        _save(content)
+        _prune_expired(project_name, expired, cutoff)
 
     return {
         task_id: folder_id
         for task_id, folder_id in valid.items()
         if folder_id
     }
+
+
+def _prune_expired(project_name, task_ids, cutoff):
+    """Drop expired entries with a fresh read-merge-write.
+
+    This prune runs on the READER side (the tray) while DCC processes
+    keep writing new entries - saving the copy loaded at the top of
+    'get_tracked_tasks' could drop a task recorded in between.
+    Re-reading right before the write shrinks that window to near zero,
+    and only entries still expired in the fresh copy are removed (a task
+    re-opened meanwhile survives).
+    """
+    try:
+        content = _load()
+        project_tasks = content.get(project_name) or {}
+        changed = False
+        for task_id in task_ids:
+            info = project_tasks.get(task_id)
+            if info and (info.get("opened") or 0) < cutoff:
+                project_tasks.pop(task_id, None)
+                changed = True
+        if changed:
+            _save(content)
+    except Exception:
+        log.warning("Couldn't prune tracked tasks", exc_info=True)

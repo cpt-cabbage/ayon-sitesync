@@ -199,13 +199,70 @@ class AutoDownloader:
         Returns:
             int: Number of newly queued representations across projects.
         """
-        queued_total = 0
+        return self.queue_render_downloads(self.collect_render_downloads())
+
+    def collect_render_downloads(self):
+        """Scan phase: what 'download_renders' WOULD queue, with sizes.
+
+        Split from the queueing so the control panel can show the total
+        size and ask for confirmation before committing what may be the
+        heaviest download the addon can trigger. Applies every gate the
+        queue phase relies on (enabled, kill switch, pause - global AND
+        per project - sites, free space).
+
+        Returns:
+            list[dict]: one entry per queueable representation with
+                'project', 'repre_id', 'site', 'size' (bytes) and a
+                human-readable 'label'.
+        """
+        # respect the tray-wide pause too - the docstrings promise it
+        # and only the project-level check used to run
+        if self.addon.is_paused():
+            log.info("Syncing is paused - not collecting render downloads")
+            return []
+        entries = []
         for project_name in self.addon.get_enabled_projects():
             try:
-                queued_total += self._download_project_renders(project_name)
+                entries.extend(self._collect_project_renders(project_name))
             except Exception:
                 log.warning(
-                    "Render download failed for project '{}'".format(
+                    "Render scan failed for project '{}'".format(
+                        project_name),
+                    exc_info=True
+                )
+        return entries
+
+    def queue_render_downloads(self, entries):
+        """Queue phase: add the scanned entries to their local sites.
+
+        The confirm dialog between scan and queue can sit open for any
+        amount of time, so EVERY gate the scan applied is re-applied
+        here at the moment of commitment - the admin kill switch, pause
+        and free space must not be bypassable by a dialog opened before
+        they were engaged - and each entry's state is re-validated
+        (still remote-OK/local-NA) so a repre whose remote record was
+        removed meanwhile cannot mint the QUEUED/NA pair.
+
+        Returns:
+            int: Number of newly queued representations.
+        """
+        if self.addon.is_paused():
+            log.info("Syncing is paused - not queueing render downloads")
+            return 0
+
+        by_project = {}
+        for entry in entries:
+            by_project.setdefault(entry["project"], []).append(entry)
+
+        queued_total = 0
+        for project_name, project_entries in by_project.items():
+            try:
+                queued_total += self._queue_project_renders(
+                    project_name, project_entries
+                )
+            except Exception:
+                log.warning(
+                    "Render queueing failed for project '{}'".format(
                         project_name),
                     exc_info=True
                 )
@@ -213,7 +270,7 @@ class AutoDownloader:
             self.addon.reset_timer()
         return queued_total
 
-    def _download_project_renders(self, project_name):
+    def _queue_project_renders(self, project_name, entries):
         addon = self.addon
         settings = addon.sync_project_settings.get(project_name)
         if not settings or not settings["enabled"]:
@@ -221,14 +278,70 @@ class AutoDownloader:
         if addon.is_project_paused(project_name):
             return 0
         config = settings["config"]
-        # the studio-wide kill switch covers this button too; only the
-        # artist-local pref and the ledger are bypassed
         if not config.get("enable_auto_download", True):
+            log.info(
+                "Auto-download kill switch engaged - not queueing"
+                " renders for '{}'".format(project_name)
+            )
             return 0
-
         sites = self._transfer_sites(project_name)
         if sites is None:
             return 0
+        local_site, remote_site = sites
+        if not self._enough_free_space(project_name, config):
+            return 0
+
+        valid_ids = {
+            state["representationId"]
+            for state in self._queueable_states(
+                project_name,
+                [entry["repre_id"] for entry in entries],
+                local_site,
+                remote_site,
+                set(),
+            )
+        }
+        queued = 0
+        for entry in entries:
+            if entry["repre_id"] not in valid_ids:
+                continue
+            try:
+                addon.add_site(
+                    project_name, entry["repre_id"], local_site,
+                    force=False, follow_links=False
+                )
+                queued += 1
+            except SiteAlreadyPresentError:
+                pass
+            except Exception:
+                log.warning(
+                    "Couldn't queue render representation '{}'".format(
+                        entry["repre_id"]),
+                    exc_info=True
+                )
+        if queued:
+            log.info(
+                "Queued {} render representation(s) for download in"
+                " '{}'".format(queued, project_name)
+            )
+        return queued
+
+    def _collect_project_renders(self, project_name):
+        addon = self.addon
+        settings = addon.sync_project_settings.get(project_name)
+        if not settings or not settings["enabled"]:
+            return []
+        if addon.is_project_paused(project_name):
+            return []
+        config = settings["config"]
+        # the studio-wide kill switch covers this button too; only the
+        # artist-local pref and the ledger are bypassed
+        if not config.get("enable_auto_download", True):
+            return []
+
+        sites = self._transfer_sites(project_name)
+        if sites is None:
+            return []
         local_site, remote_site = sites
 
         folder_id_by_task_id = self._get_relevant_tasks(
@@ -249,38 +362,31 @@ class AutoDownloader:
                 link_direction="out",
             ))
         if not candidate_ids:
-            return 0
+            return []
 
         if not self._enough_free_space(project_name, config):
-            return 0
+            return []
 
         # throwaway set instead of the ledger: an explicit request must
         # not be vetoed by (or pollute) the auto-download memory
-        to_queue = self._filter_by_state(
+        entries = []
+        for state in self._queueable_states(
             project_name, candidate_ids, local_site, remote_site, set()
-        )
-        queued = 0
-        for repre_id in to_queue:
-            try:
-                addon.add_site(
-                    project_name, repre_id, local_site, force=False,
-                    follow_links=False
-                )
-                queued += 1
-            except SiteAlreadyPresentError:
-                pass
-            except Exception:
-                log.warning(
-                    "Couldn't queue render representation '{}'".format(
-                        repre_id),
-                    exc_info=True
-                )
-        if queued:
-            log.info(
-                "Queued {} render representation(s) for download in"
-                " '{}'".format(queued, project_name)
-            )
-        return queued
+        ):
+            entries.append({
+                "project": project_name,
+                "repre_id": state["representationId"],
+                "site": local_site,
+                "size": state.get("size") or 0,
+                "label": "{} / {} / {} / v{:03d} / {}".format(
+                    project_name,
+                    state.get("folder") or "?",
+                    state.get("product") or "?",
+                    state.get("version") or 0,
+                    state.get("representation") or "?",
+                ),
+            })
+        return entries
 
     def _get_relevant_tasks(self, project_name, config):
         """Tasks whose content should live on this machine.
@@ -355,21 +461,23 @@ class AutoDownloader:
             ))
         return candidate_ids
 
-    def _filter_by_state(
+    def _queueable_states(
         self, project_name, repre_ids, local_site, remote_site, ledger
     ):
-        """Keep ids that are on remote but have no local record yet.
+        """State dicts of ids that are on remote but have no local record.
 
-        Ids already present locally (queued, syncing, done, failed) go
-        straight to the ledger - they are handled. Ids not yet uploaded
-        to the remote site are left out of BOTH (retried next pass):
-        queueing them would create a queued/NA pair the sync loop never
-        matches.
+        THE single implementation of the queueability rule - every
+        download path (periodic auto-download, the renders button's scan
+        AND its commitment phase) must go through it. Ids already
+        present locally (queued, syncing, done, failed) go straight to
+        the ledger - they are handled. Ids not yet uploaded to the
+        remote site are left out of BOTH (retried next pass): queueing
+        them would create a queued/NA pair the sync loop never matches.
         """
         repre_states = self.addon._get_repres_state(
             project_name, set(repre_ids), local_site, remote_site
         )
-        to_queue = []
+        queueable = []
         for state in repre_states:
             repre_id = state["representationId"]
             local_status = state["localStatus"]["status"]
@@ -378,8 +486,19 @@ class AutoDownloader:
                 ledger.add(repre_id)
                 continue
             if remote_status == SiteSyncStatus.OK:
-                to_queue.append(repre_id)
-        return to_queue
+                queueable.append(state)
+        return queueable
+
+    def _filter_by_state(
+        self, project_name, repre_ids, local_site, remote_site, ledger
+    ):
+        """Ids variant of '_queueable_states' for the periodic path."""
+        return [
+            state["representationId"]
+            for state in self._queueable_states(
+                project_name, repre_ids, local_site, remote_site, ledger
+            )
+        ]
 
     def _enough_free_space(self, project_name, config):
         min_free_gb = float(config.get("min_free_space_gb") or 0)

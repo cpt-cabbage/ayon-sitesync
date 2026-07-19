@@ -33,6 +33,7 @@ from ayon_core.lib import Logger
 from ayon_core.pipeline import Anatomy
 
 from .machine_role import ROLE_STUDIO, probe_machine_role
+from .providers.transfer_utils import make_tmp_path, cleanup_tmp
 
 log = Logger.get_logger("SiteSync")
 
@@ -118,8 +119,22 @@ def mirror_workarea_files(addon, project_name, task_ids, extensions=None):
             try:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 # copy2 keeps mtime so 'newest workfile' logic in tools
-                # keeps working on the copy
-                shutil.copy2(src, dst)
+                # keeps working on the copy. Copy to a unique temp name
+                # and replace into place: the mirror NEVER overwrites an
+                # existing local file (local edits win), so a truncated
+                # direct copy from a dropped VPN would be permanently
+                # protected from repair - and then opened as the
+                # "newest work-area workfile" by the launch hook.
+                tmp_dst = make_tmp_path(dst)
+                try:
+                    shutil.copy2(src, tmp_dst)
+                    if (
+                        os.path.getsize(tmp_dst) != os.path.getsize(src)
+                    ):
+                        raise OSError("size mismatch after copy")
+                    os.replace(tmp_dst, dst)
+                finally:
+                    cleanup_tmp(tmp_dst)
                 copied += 1
             except Exception:
                 log.warning(
