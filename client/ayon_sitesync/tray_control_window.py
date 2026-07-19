@@ -21,6 +21,7 @@ keep it that way, REST on the UI thread freezes the tray.
 Only imported from the tray process (Qt available).
 """
 import threading
+import time
 from datetime import datetime
 
 from qtpy import QtWidgets, QtCore, QtGui
@@ -159,8 +160,15 @@ def _collect_queue_rows(addon):
     Runs in a worker thread. The endpoint ANDs local and remote status
     filters, so 'active on either side' needs one call per side, merged
     by representation id.
+
+    Returns:
+        tuple[list, bool]: (rows, had_error). A fetch failure MUST be
+            distinguishable from a genuinely empty queue - an empty
+            result caused by an unreachable server used to render as
+            "everything is in sync".
     """
     rows = []
+    had_error = False
     for project_name in addon.get_enabled_projects():
         try:
             local_site = addon.get_active_site(project_name)
@@ -170,45 +178,44 @@ def _collect_queue_rows(addon):
 
             merged = {}
             for side in ("local", "remote"):
-                # Page until a short page so a busy queue isn't silently
-                # truncated at one page; the page cap only bounds a
-                # pathological backlog.
-                for page in range(1, _QUEUE_MAX_PAGES + 1):
-                    kwargs = {
-                        "localSite": local_site,
-                        "remoteSite": remote_site,
-                        "page": page,
-                        "pageLength": _QUEUE_PAGE_LENGTH,
-                        "{}StatusFilter".format(side): (
-                            list(_ACTIVE_STATUSES)
-                        ),
-                    }
-                    response = ayon_api.get(
-                        "{}/{}/state".format(
-                            addon.endpoint_prefix, project_name),
+                # Page until a short page (via the shared pager) so a
+                # busy queue isn't silently truncated; the page cap only
+                # bounds a pathological backlog. Per-side containment:
+                # one failing side still renders the other.
+                kwargs = {
+                    "localSite": local_site,
+                    "remoteSite": remote_site,
+                    "{}StatusFilter".format(side): list(_ACTIVE_STATUSES),
+                }
+                try:
+                    side_rows = _fetch_state_pages(
+                        addon, project_name,
+                        _QUEUE_MAX_PAGES, _QUEUE_PAGE_LENGTH,
                         **kwargs
                     )
-                    if response.status_code != 200:
-                        break
-                    rows_page = (
-                        response.data.get("representations") or []
+                except Exception:
+                    had_error = True
+                    addon.log.warning(
+                        "Sync control: state fetch of '{}' failed".format(
+                            project_name),
+                        exc_info=True
                     )
-                    for repre in rows_page:
-                        merged[repre["representationId"]] = repre
-                    if len(rows_page) < _QUEUE_PAGE_LENGTH:
-                        break
+                    continue
+                for repre in side_rows:
+                    merged[repre["representationId"]] = repre
 
             for repre in merged.values():
                 rows.append(
                     _make_row(project_name, local_site, remote_site, repre)
                 )
         except Exception:
+            had_error = True
             addon.log.warning(
                 "Sync control: couldn't fetch state of '{}'".format(
                     project_name),
                 exc_info=True
             )
-    return rows
+    return rows, had_error
 
 
 def _collect_file_rows(addon, project_name, page, status, search_text):
@@ -220,11 +227,14 @@ def _collect_file_rows(addon, project_name, page, status, search_text):
     "Fully synced", which really is local AND remote OK in one call.
     Paging over merged calls is per-call, so a page can hold up to
     (calls x pageLength) rows; that is fine for a browsing UI.
+
+    Returns:
+        tuple[list, bool]: (rows, had_error) - see '_collect_queue_rows'.
     """
     local_site = addon.get_active_site(project_name)
     remote_site = addon.get_remote_site(project_name)
     if not local_site or local_site == remote_site:
-        return []
+        return [], False
 
     base_kwargs = {
         "localSite": local_site,
@@ -232,6 +242,12 @@ def _collect_file_rows(addon, project_name, page, status, search_text):
         "page": page,
         "pageLength": _FILES_PAGE_LENGTH,
     }
+
+    if status == SiteSyncStatus.PAUSED:
+        return _collect_paused_rows(
+            addon, project_name, local_site, remote_site,
+            base_kwargs, search_text
+        )
 
     if status is None:
         status_variants = [{}]
@@ -255,6 +271,7 @@ def _collect_file_rows(addon, project_name, page, status, search_text):
         search_variants = [{}]
 
     merged = {}
+    had_error = False
     for status_kwargs in status_variants:
         for search_kwargs in search_variants:
             kwargs = dict(base_kwargs)
@@ -265,6 +282,11 @@ def _collect_file_rows(addon, project_name, page, status, search_text):
                 **kwargs
             )
             if response.status_code != 200:
+                addon.log.warning(
+                    "Sync control: file list fetch of '{}' returned"
+                    " {}".format(project_name, response.status_code)
+                )
+                had_error = True
                 continue
             for repre in response.data.get("representations") or []:
                 merged[repre["representationId"]] = repre
@@ -273,12 +295,108 @@ def _collect_file_rows(addon, project_name, page, status, search_text):
         _make_row(project_name, local_site, remote_site, repre)
         for repre in merged.values()
     ]
-    rows.sort(key=lambda row: (
+    rows.sort(key=_row_sort_key)
+    return rows, had_error
+
+
+def _row_sort_key(row):
+    return (
         row["repre"].get("folder") or "",
         row["repre"].get("product") or "",
         row["repre"].get("version") or 0,
         row["repre"].get("representation") or "",
-    ))
+    )
+
+
+def _collect_paused_rows(
+    addon, project_name, local_site, remote_site, base_kwargs, search_text
+):
+    """Rows for the 'Paused' filter.
+
+    The panel's own pause is session-only (in-memory - it never writes
+    the PAUSED DB status), so a server-side status filter can never find
+    it, and an unfiltered page would miss paused rows sorting past the
+    page boundary. The session-paused ids are fetched EXACTLY (chunked
+    and paged by '_get_repres_state'), then genuinely DB-paused rows of
+    either side are merged in. The result set is small by nature and is
+    not paged.
+    """
+    merged = {}
+    had_error = False
+    paused_ids = list(addon.get_paused_representations())
+    if paused_ids:
+        try:
+            for state in addon._get_repres_state(
+                project_name, paused_ids, local_site, remote_site
+            ):
+                merged[state["representationId"]] = state
+        except Exception:
+            had_error = True
+            addon.log.warning(
+                "Sync control: couldn't fetch session-paused rows",
+                exc_info=True
+            )
+
+    for side_key in ("localStatusFilter", "remoteStatusFilter"):
+        kwargs = dict(base_kwargs)
+        kwargs["page"] = 1
+        kwargs[side_key] = [SiteSyncStatus.PAUSED]
+        response = ayon_api.get(
+            "{}/{}/state".format(addon.endpoint_prefix, project_name),
+            **kwargs
+        )
+        if response.status_code != 200:
+            had_error = True
+            continue
+        for repre in response.data.get("representations") or []:
+            merged[repre["representationId"]] = repre
+
+    rows = [
+        _make_row(project_name, local_site, remote_site, repre)
+        for repre in merged.values()
+    ]
+    if search_text:
+        needle = search_text.lower()
+        rows = [
+            row for row in rows
+            if needle in (row["repre"].get("folder") or "").lower()
+            or needle in (row["repre"].get("product") or "").lower()
+        ]
+    rows.sort(key=_row_sort_key)
+    return rows, had_error
+
+
+def _fetch_state_pages(addon, project_name, max_pages, page_length, **kwargs):
+    """Every row of a /state query, paged until a short page.
+
+    Runs in worker threads. Returns the RAW representation dicts from
+    the endpoint (not UI rows). Raises on a non-200 so callers report a
+    failed scan instead of a confidently empty one; hitting 'max_pages'
+    is logged so a truncated scan never silently reads as complete.
+    """
+    rows = []
+    for page in range(1, max_pages + 1):
+        query = dict(kwargs)
+        query["page"] = page
+        query["pageLength"] = page_length
+        response = ayon_api.get(
+            "{}/{}/state".format(addon.endpoint_prefix, project_name),
+            **query
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                "State query of '{}' failed with {}".format(
+                    project_name, response.status_code)
+            )
+        page_rows = response.data.get("representations") or []
+        rows.extend(page_rows)
+        if len(page_rows) < page_length:
+            break
+    else:
+        addon.log.warning(
+            "State scan of '{}' hit the {}-page cap - result is"
+            " truncated".format(project_name, max_pages)
+        )
     return rows
 
 
@@ -298,6 +416,7 @@ def _collect_superseded_rows(addon):
     """
     local_site_id = get_local_site_id()
     entries = []
+    had_error = False
     for project_name in addon.get_enabled_projects():
         try:
             local_site = addon.get_active_site(project_name)
@@ -361,12 +480,65 @@ def _collect_superseded_rows(addon):
                         ),
                     })
         except Exception:
+            had_error = True
             addon.log.warning(
                 "Cleanup scan failed for project '{}'".format(
                     project_name),
                 exc_info=True
             )
+    if had_error and not entries:
+        # every project failed - report a failed scan, never a
+        # confidently empty "nothing to clean up"
+        return None
     return entries
+
+
+def _revalidate_cleanup_entries(addon, entries):
+    """Keep only cleanup entries that are STILL safe to delete.
+
+    Runs in a worker thread, right before deletion. The safety invariant
+    of the cleanup is "both sides fully synced, so deleting the local
+    bytes loses nothing" - re-checked here because the confirm dialog
+    can sit open for any amount of time while transfers, retries or a
+    republish change the picture. One batched state call per project.
+    """
+    by_project = {}
+    for entry in entries:
+        by_project.setdefault(entry["project"], []).append(entry)
+
+    still_valid = []
+    for project_name, project_entries in by_project.items():
+        try:
+            local_site = project_entries[0]["local_site"]
+            remote_site = addon.get_remote_site(project_name)
+            states = addon._get_repres_state(
+                project_name,
+                [entry["repre_id"] for entry in project_entries],
+                local_site,
+                remote_site,
+            )
+            ok_ids = {
+                state["representationId"]
+                for state in states
+                if state["localStatus"]["status"] == SiteSyncStatus.OK
+                and state["remoteStatus"]["status"] == SiteSyncStatus.OK
+            }
+            for entry in project_entries:
+                if entry["repre_id"] in ok_ids:
+                    still_valid.append(entry)
+                else:
+                    addon.log.info(
+                        "Cleanup: skipping '{}' - its sync state changed"
+                        " since the scan".format(entry["label"])
+                    )
+        except Exception:
+            # can't verify -> don't delete anything of this project
+            addon.log.warning(
+                "Cleanup: couldn't re-validate entries of '{}' -"
+                " skipping them".format(project_name),
+                exc_info=True
+            )
+    return still_valid
 
 
 class SyncControlWindow(QtWidgets.QWidget):
@@ -380,6 +552,7 @@ class SyncControlWindow(QtWidgets.QWidget):
     # own worker re-enables them - a shared completion (e.g. a quick row
     # retry finishing) must not re-enable a button whose worker still runs
     _renders_done = QtCore.Signal(str)
+    _renders_scan_done = QtCore.Signal(object)
     _cleanup_scan_done = QtCore.Signal(object)
     _cleanup_remove_done = QtCore.Signal(str)
 
@@ -387,8 +560,19 @@ class SyncControlWindow(QtWidgets.QWidget):
         super(SyncControlWindow, self).__init__(parent)
         self._addon = addon
         self._queue_fetch_running = False
-        self._files_fetch_running = False
         self._files_page = 1
+        # Generation counters for file fetches: 'seq' advances when a
+        # fetch starts, 'applied_seq' when its result lands. "A fetch is
+        # in flight" is exactly seq != applied_seq - no separate boolean
+        # to drift out of step. A project/filter/page change bumps seq
+        # (invalidating the in-flight fetch, whose stale rows are then
+        # discarded) and re-fetches immediately.
+        self._files_fetch_seq = 0
+        self._files_applied_seq = 0
+        # action results/errors stay visible for a bit - the refresh
+        # triggered right after an action used to overwrite them with
+        # "Updated HH:MM:SS" within a second
+        self._status_sticky_until = 0.0
 
         self.setWindowTitle("AYON Site Sync")
         self.resize(1000, 560)
@@ -425,6 +609,7 @@ class SyncControlWindow(QtWidgets.QWidget):
         self._action_done.connect(self._on_action_done)
         self._projects_done.connect(self._apply_projects)
         self._renders_done.connect(self._on_renders_done)
+        self._renders_scan_done.connect(self._on_renders_scan_done)
         self._cleanup_scan_done.connect(self._on_cleanup_scan_done)
         self._cleanup_remove_done.connect(self._on_cleanup_remove_done)
 
@@ -696,25 +881,34 @@ class SyncControlWindow(QtWidgets.QWidget):
 
         def _run():
             try:
-                rows = _collect_queue_rows(self._addon)
+                rows, had_error = _collect_queue_rows(self._addon)
             except Exception:
                 self._addon.log.warning(
                     "Sync queue refresh failed", exc_info=True
                 )
-                rows = []
-            self._queue_done.emit(rows)
+                rows, had_error = [], True
+            self._queue_done.emit({"rows": rows, "error": had_error})
 
         self._run_bg(_run)
 
-    def _refresh_files(self):
-        if self._files_fetch_running:
+    def _refresh_files(self, force=False):
+        """Fetch the files tab.
+
+        'force' bypasses the in-flight guard - used by project/filter/
+        page changes, which also bump the generation counter so the
+        superseded fetch's result is discarded instead of rendering old
+        rows under the new selection.
+        """
+        in_flight = self._files_fetch_seq != self._files_applied_seq
+        if in_flight and not force:
             return
         if self._tabs.currentIndex() != 1:
             return
         project_name = self._project_combo.currentText()
         if not project_name:
             return
-        self._files_fetch_running = True
+        self._files_fetch_seq += 1
+        seq = self._files_fetch_seq
 
         page = self._files_page
         status = self._status_combo.currentData()
@@ -722,20 +916,27 @@ class SyncControlWindow(QtWidgets.QWidget):
 
         def _run():
             try:
-                rows = _collect_file_rows(
+                rows, had_error = _collect_file_rows(
                     self._addon, project_name, page, status, search_text
                 )
             except Exception:
                 self._addon.log.warning(
                     "Sync file list refresh failed", exc_info=True
                 )
-                rows = []
-            self._files_done.emit(rows)
+                rows, had_error = [], True
+            self._files_done.emit({
+                "seq": seq,
+                "page": page,
+                "rows": rows,
+                "error": had_error,
+            })
 
         self._run_bg(_run)
 
-    def _apply_queue_rows(self, rows):
+    def _apply_queue_rows(self, payload):
         self._queue_fetch_running = False
+        rows = payload["rows"]
+        had_error = payload["error"]
         view = self._queue_view
         scroll_pos = view.verticalScrollBar().value()
         view.clear()
@@ -776,12 +977,31 @@ class SyncControlWindow(QtWidgets.QWidget):
         has_rows = bool(rows)
         view.setVisible(has_rows)
         view.verticalScrollBar().setValue(scroll_pos)
+        # A fetch failure must never render as "everything is in sync" -
+        # a VPN-less artist with 40 failing transfers used to get a
+        # green-looking panel with a fresh timestamp.
+        if had_error and not has_rows:
+            self._queue_empty_label.setText(
+                "Couldn't reach the server - the sync state is unknown."
+                " See the log."
+            )
+        else:
+            self._queue_empty_label.setText(
+                "Nothing is queued - everything on this machine is in"
+                " sync."
+            )
         self._queue_empty_label.setVisible(not has_rows)
         self._retry_btn.setEnabled(any_failed)
-        self._mark_updated()
+        self._mark_updated(had_error)
 
-    def _apply_file_rows(self, rows):
-        self._files_fetch_running = False
+    def _apply_file_rows(self, payload):
+        if payload["seq"] != self._files_fetch_seq:
+            # a newer fetch (changed project/filter/page) superseded
+            # this one - never render stale rows under a new selection
+            return
+        self._files_applied_seq = payload["seq"]
+        rows = payload["rows"]
+        had_error = payload["error"]
         view = self._files_view
         scroll_pos = view.verticalScrollBar().value()
         view.clear()
@@ -822,24 +1042,50 @@ class SyncControlWindow(QtWidgets.QWidget):
         has_rows = bool(rows)
         view.setVisible(has_rows)
         view.verticalScrollBar().setValue(scroll_pos)
+        if had_error and not has_rows:
+            self._files_empty_label.setText(
+                "Couldn't reach the server - the file list is unknown."
+                " See the log."
+            )
+        else:
+            self._files_empty_label.setText(
+                "No tracked files match the current filter."
+            )
         self._files_empty_label.setVisible(not has_rows)
-        self._page_label.setText("Page {}".format(self._files_page))
-        self._prev_btn.setEnabled(self._files_page > 1)
+        self._page_label.setText("Page {}".format(payload["page"]))
+        self._prev_btn.setEnabled(payload["page"] > 1)
         # merged calls can exceed one pageLength; a "full-ish" page means
         # there may be more
         self._next_btn.setEnabled(len(rows) >= _FILES_PAGE_LENGTH)
-        self._mark_updated()
+        self._mark_updated(had_error)
 
-    def _mark_updated(self):
-        self._status_label.setText(
-            "Updated {}".format(datetime.now().strftime("%H:%M:%S"))
-        )
+    def _set_status(self, message, sticky=False):
+        """Set the status label; 'sticky' holds it for 10s.
+
+        Action results and errors must survive the refresh that follows
+        them - '_mark_updated' used to clobber the message with
+        "Updated HH:MM:SS" within a second. Every terminal action
+        message (success, failure, cancellation) should be sticky;
+        transient progress notes need not be.
+        """
+        self._status_label.setText(message)
+        if sticky:
+            self._status_sticky_until = time.time() + 10
+
+    def _mark_updated(self, had_error=False):
+        # don't clobber a recent action result/error with the timestamp
+        if time.time() < self._status_sticky_until:
+            return
+        text = "Updated {}".format(datetime.now().strftime("%H:%M:%S"))
+        if had_error:
+            text = "{} (some fetches failed - see the log)".format(text)
+        self._status_label.setText(text)
 
     def _on_action_done(self, message):
         if message:
-            self._status_label.setText(message)
+            self._set_status(message, sticky=True)
         self._refresh_queue()
-        self._refresh_files()
+        self._refresh_files(force=True)
 
     def _on_renders_done(self, message):
         self._renders_btn.setEnabled(True)
@@ -852,7 +1098,7 @@ class SyncControlWindow(QtWidgets.QWidget):
     # controls bar actions -----------------------------------------------
     def _on_sync_now(self):
         self._addon._on_tray_sync_now()
-        self._status_label.setText("Sync pass requested")
+        self._set_status("Sync pass requested", sticky=True)
 
     def _on_pause_clicked(self, checked=False):
         # the addon updates every UI (tray action + this window)
@@ -865,13 +1111,67 @@ class SyncControlWindow(QtWidgets.QWidget):
         self._addon._on_tray_validate()
 
     def _on_download_renders(self):
+        # scan first, confirm with the total size, queue only on Yes -
+        # renders are the heaviest data the addon can pull and used to
+        # queue without any "this will fetch N GB" moment
         self._renders_btn.setEnabled(False)
-        self._status_label.setText("Looking for renders to download...")
+        self._set_status("Looking for renders to download...")
         addon = self._addon
 
         def _run():
             try:
-                count = addon.download_my_renders()
+                entries = addon.collect_my_render_downloads()
+            except Exception:
+                addon.log.warning(
+                    "Render scan failed", exc_info=True
+                )
+                entries = None
+            self._renders_scan_done.emit(entries)
+
+        self._run_bg(_run)
+
+    def _on_renders_scan_done(self, entries):
+        self._renders_btn.setEnabled(True)
+        if not self.isVisible():
+            return
+        if entries is None:
+            self._set_status(
+                "Render scan failed - see the log", sticky=True)
+            return
+        if not entries:
+            self._set_status(
+                "No new renders to download for your tasks", sticky=True)
+            return
+
+        total_size = sum(entry["size"] for entry in entries)
+        lines = [
+            "{} - {}".format(entry["label"], _format_size(entry["size"]))
+            for entry in entries
+        ]
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Download my renders")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText(
+            "Queue {} render representation(s) (about {}) for download"
+            " to this machine?\n\nClick 'Show Details...' for the full"
+            " list.".format(len(entries), _format_size(total_size))
+        )
+        box.setDetailedText("\n".join(lines))
+        box.setStandardButtons(
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        box.setDefaultButton(QtWidgets.QMessageBox.No)
+        if box.exec_() != QtWidgets.QMessageBox.Yes:
+            self._set_status("Render download cancelled", sticky=True)
+            return
+
+        self._renders_btn.setEnabled(False)
+        self._set_status("Queueing render downloads...")
+        addon = self._addon
+
+        def _run():
+            try:
+                count = addon.queue_my_render_downloads(entries)
                 if count:
                     message = (
                         "Queued {} render representation(s) for"
@@ -892,7 +1192,7 @@ class SyncControlWindow(QtWidgets.QWidget):
 
     def _on_cleanup(self):
         self._cleanup_btn.setEnabled(False)
-        self._status_label.setText("Scanning for superseded versions...")
+        self._set_status("Scanning for superseded versions...")
         addon = self._addon
 
         def _run():
@@ -909,14 +1209,18 @@ class SyncControlWindow(QtWidgets.QWidget):
 
     def _on_cleanup_scan_done(self, entries):
         self._cleanup_btn.setEnabled(True)
+        if not self.isVisible():
+            # the artist closed the window while the scan ran - don't
+            # pop a confirm dialog "out of nowhere"
+            return
         if entries is None:
-            self._status_label.setText("Cleanup scan failed - see the log")
+            self._set_status(
+                "Cleanup scan failed - see the log", sticky=True)
             return
         if not entries:
-            self._status_label.setText(
+            self._set_status(
                 "Nothing to clean up - no superseded versions are"
-                " downloaded on this machine"
-            )
+                " downloaded on this machine", sticky=True)
             return
 
         total_size = sum(entry["size"] for entry in entries)
@@ -945,17 +1249,26 @@ class SyncControlWindow(QtWidgets.QWidget):
         )
         box.setDefaultButton(QtWidgets.QMessageBox.No)
         if box.exec_() != QtWidgets.QMessageBox.Yes:
-            self._status_label.setText("Cleanup cancelled")
+            self._set_status("Cleanup cancelled", sticky=True)
             return
 
         self._cleanup_btn.setEnabled(False)
-        self._status_label.setText("Removing superseded versions...")
+        self._set_status("Removing superseded versions...")
         addon = self._addon
 
         def _run():
+            # Re-validate right before deleting: the confirm dialog can
+            # sit open indefinitely, and meanwhile a remote record may
+            # have been requeued (deleting would drop the only verified
+            # copy's local twin) or the repre removed. Skipped entries
+            # are reported, and 'freed' counts only what was actually
+            # removed - remove_site returns silently when the record is
+            # already gone, which used to be counted as freed space.
+            still_valid = _revalidate_cleanup_entries(addon, entries)
             removed = 0
             freed = 0
-            for entry in entries:
+            skipped = len(entries) - len(still_valid)
+            for entry in still_valid:
                 try:
                     addon.remove_site(
                         entry["project"],
@@ -971,10 +1284,15 @@ class SyncControlWindow(QtWidgets.QWidget):
                         exc_info=True
                     )
             message = (
-                "Removed {} of {} representation(s), freed about"
+                "Removed {} of {} representation(s), freed up to"
                 " {}".format(removed, len(entries), _format_size(freed))
             )
-            if removed < len(entries):
+            if skipped:
+                message = (
+                    "{} ({} skipped - their sync state changed since the"
+                    " scan)".format(message, skipped)
+                )
+            if removed + skipped < len(entries):
                 message = "{} - see the log for failures".format(message)
             self._cleanup_remove_done.emit(message)
 
@@ -986,16 +1304,16 @@ class SyncControlWindow(QtWidgets.QWidget):
     # files tab paging/filtering -----------------------------------------
     def _on_files_filter_changed(self, *_args):
         self._files_page = 1
-        self._refresh_files()
+        self._refresh_files(force=True)
 
     def _on_files_prev_page(self):
         if self._files_page > 1:
             self._files_page -= 1
-            self._refresh_files()
+            self._refresh_files(force=True)
 
     def _on_files_next_page(self):
         self._files_page += 1
-        self._refresh_files()
+        self._refresh_files(force=True)
 
     # row actions --------------------------------------------------------
     def _open_row_menu(self, view, pos):
@@ -1012,6 +1330,9 @@ class SyncControlWindow(QtWidgets.QWidget):
         repre_id = row["repre_id"]
 
         menu = QtWidgets.QMenu(self)
+        # QMenu does not display action tooltips unless asked - without
+        # this every setToolTip below is dead text
+        menu.setToolTipsVisible(True)
 
         if SiteSyncStatus.FAILED in (local_status, remote_status):
             action = menu.addAction("Retry failed transfer")
@@ -1019,10 +1340,18 @@ class SyncControlWindow(QtWidgets.QWidget):
                 lambda _=False, r=row: self._retry_row(r)
             )
 
-        if local_status not in (
-            SiteSyncStatus.OK,
-            SiteSyncStatus.QUEUED,
-            SiteSyncStatus.IN_PROGRESS,
+        # Download requires the REMOTE side to be fully synced - queueing
+        # a download whose source is NA would mint the QUEUED/NA pair the
+        # sync loop can never match (and, because the repre then HAS a
+        # row, permanently disqualify it from the zero-record backfill).
+        # Mirrors the Upload guard below and the linked-record rules.
+        if (
+            remote_status == SiteSyncStatus.OK
+            and local_status not in (
+                SiteSyncStatus.OK,
+                SiteSyncStatus.QUEUED,
+                SiteSyncStatus.IN_PROGRESS,
+            )
         ):
             action = menu.addAction("Download to this machine")
             action.triggered.connect(
