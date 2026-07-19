@@ -14,8 +14,27 @@ from ayon_core.pipeline import Anatomy
 from ayon_core.pipeline.load import get_representation_path_with_anatomy
 
 from .providers import lib
+from .providers.exceptions import (
+    TransferPausedError,
+    TransientTransferError,
+)
 from .utils import SyncStatus, ResumableError, get_linked_representation_id
 from .auto_download import AutoDownloader
+
+# Wall-clock ceiling for the blocking workfile download during launch.
+# The retry-based bail-out below only fires when transfer ATTEMPTS fail -
+# with no tray/sync service running the record just sits QUEUED, retries
+# stays 0 and the artist used to be stuck in the launch dialog forever.
+_WORKFILE_WAIT_CEILING = 1200  # seconds
+
+# How often (per project) the loop asks the server to requeue IN_PROGRESS
+# files that stopped receiving updates (tray killed mid-transfer). The
+# server sweeps EVERY site of the project (a wiped machine's own tray is
+# exactly the one that will never ask for its site) and judges staleness
+# by its OWN clock stamps, so the age just needs to exceed any realistic
+# progress-post gap.
+_STALE_REQUEUE_INTERVAL = 900  # seconds
+_STALE_REQUEUE_AGE = 3600  # seconds without an update = dead transfer
 
 
 async def upload(
@@ -157,6 +176,26 @@ async def download(
         local_site,
         True
     )
+
+    # Provider-agnostic integrity check: the DB knows the expected size,
+    # so never mark a short/corrupt download OK. (local_drive/sftp verify
+    # sizes themselves; cloud providers used to trust their API blindly.)
+    expected_size = file.get("size")
+    if expected_size:
+        try:
+            actual_size = os.path.getsize(local_file_path)
+        except OSError:
+            actual_size = None
+        if actual_size is not None and actual_size != expected_size:
+            try:
+                os.remove(local_file_path)
+            except OSError:
+                pass
+            raise OSError(
+                "Downloaded file '{}' has size {} but the representation"
+                " expects {} - removed, will retry".format(
+                    local_file_path, actual_size, expected_size)
+            )
 
     return file_id
 
@@ -300,26 +339,49 @@ def download_last_published_workfile(
         if not sitesync_addon.is_representation_on_site(
             project_name, repre_id, local_site_id
         ):
-            sitesync_addon.add_site(
-                project_name,
-                repre_id,
-                local_site_id,
-                force=True,
-                # the artist is blocked in a launch dialog waiting for
-                # this download - jump the queue
-                priority=99,
-                # reference links were already followed above
-                follow_links=False,
-            )
+            try:
+                sitesync_addon.add_site(
+                    project_name,
+                    repre_id,
+                    local_site_id,
+                    force=True,
+                    # the artist is blocked in a launch dialog waiting
+                    # for this download - jump the queue
+                    priority=99,
+                    # reference links were already followed above
+                    follow_links=False,
+                )
+            except ValueError as exc:
+                # add_site refuses to queue a download whose remote side
+                # is not fully synced (it would mint the QUEUED/NA pair
+                # the loop can never match). A linked dependency that is
+                # not on the remote site yet must not break the launch -
+                # the workfile itself was verified above.
+                print(
+                    "Skipping linked representation {}: {}".format(
+                        repre_id, exc)
+                )
     sitesync_addon.reset_timer()
     print("Starting to download:{}".format(last_published_workfile_path))
-    # While representation unavailable locally, wait.
+    # While representation unavailable locally, wait - but never forever:
+    # 'max_retries' only counts FAILED transfer attempts, so with no
+    # tray/sync service running the record sits QUEUED with retries at 0
+    # and this used to block the launch indefinitely.
+    wait_started = time.time()
     while not sitesync_addon.is_representation_on_site(
         project_name,
         workfile_representation["id"],
         local_site_id,
         max_retries=max_retries
     ):
+        if time.time() - wait_started > _WORKFILE_WAIT_CEILING:
+            print(
+                "Timed out after {}s waiting for the workfile download -"
+                " is the tray (or a sync service) running? Launching"
+                " without the published workfile.".format(
+                    _WORKFILE_WAIT_CEILING)
+            )
+            return None
         time.sleep(5)
 
     return last_published_workfile_path
@@ -337,12 +399,24 @@ class SiteSyncThread(threading.Thread):
         self.loop = None
         self.is_running = False
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        self.timer = None
         self._warned_keys = set()
         self.auto_downloader = AutoDownloader(addon)
         # projects whose zero-record representations were already
         # backfilled this tray session
         self._backfilled_projects = set()
+        # Wake handling: '_wake_event' (created on the thread's own
+        # event loop in run()) is awaited instead of a plain sleep, so a
+        # wake arriving at ANY moment - mid-pass, or in the gap between
+        # finishing a pass and starting the wait - is never lost. The
+        # old cancel-the-timer-task approach lost wakes that landed
+        # while a pass was running (cancelling an already-finished task
+        # is a no-op) and the triggering transfer waited out the full
+        # loop_delay. '_reset_requested' only backstops calls arriving
+        # before the loop has started.
+        self._wake_event = None
+        self._reset_requested = False
+        # last per-project ask to requeue stale IN_PROGRESS files
+        self._stale_requeue_last = {}
 
     def run(self):
         self.is_running = True
@@ -352,6 +426,9 @@ class SiteSyncThread(threading.Thread):
             self.loop = asyncio.new_event_loop()  # create new loop for thread
             asyncio.set_event_loop(self.loop)
             self.loop.set_default_executor(self.executor)
+            # created here, after set_event_loop, so the primitive binds
+            # to THIS thread's loop on every supported Python version
+            self._wake_event = asyncio.Event()
 
             asyncio.ensure_future(self.check_shutdown(), loop=self.loop)
             asyncio.ensure_future(self.sync_loop(), loop=self.loop)
@@ -414,6 +491,28 @@ class SiteSyncThread(threading.Thread):
                                     self._backfill_site_records,
                                     project_name,
                                 )
+                        # Un-stick files a dead tray left IN_PROGRESS -
+                        # the loop's OK/QUEUED pair fetch can never see
+                        # them again otherwise. Throttled per project,
+                        # and only from machines that actually sync (a
+                        # not-opted-in studio workstation must not
+                        # hammer the endpoint) - the server sweeps all
+                        # sites in one call, so any syncing tray heals
+                        # everyone including dead machines' sites.
+                        now = time.time()
+                        last_requeue = self._stale_requeue_last.get(
+                            project_name, 0)
+                        if (
+                            now - last_requeue > _STALE_REQUEUE_INTERVAL
+                            and self.addon.get_active_site(project_name)
+                            != self.addon.get_remote_site(project_name)
+                        ):
+                            self._stale_requeue_last[project_name] = now
+                            await self.loop.run_in_executor(
+                                None,
+                                self._requeue_stale_transfers,
+                                project_name,
+                            )
                         # Queue missing assigned-task work first (throttled
                         # internally, never raises) so this very loop pass
                         # picks the new downloads up.
@@ -435,16 +534,26 @@ class SiteSyncThread(threading.Thread):
                 self.log.debug(
                     "Waiting for {} seconds to new loop".format(delay)
                 )
-                self.timer = asyncio.create_task(self.run_timer(delay))
-                await asyncio.gather(self.timer)
+                # A wake set at ANY point since the last clear (even
+                # mid-pass) makes this return immediately - no window in
+                # which a wake can be lost.
+                if not self._reset_requested:
+                    try:
+                        await asyncio.wait_for(
+                            self._wake_event.wait(), timeout=delay
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                self._wake_event.clear()
+                self._reset_requested = False
 
             except ConnectionResetError:
                 self.log.warning(
                     "ConnectionResetError in sync loop, trying next loop",
                     exc_info=True)
             except asyncio.exceptions.CancelledError:
-                # cancelling timer
-                pass
+                # shutdown is cancelling this coroutine's wait
+                self._reset_requested = False
             except ResumableError:
                 self.log.warning(
                     "ResumableError in sync loop, trying next loop",
@@ -460,6 +569,32 @@ class SiteSyncThread(threading.Thread):
                 # ran (e.g. fetching settings), so wait here to avoid
                 # hammering an unreachable server in a hot loop.
                 await asyncio.sleep(30)
+
+    def _requeue_stale_transfers(self, project_name):
+        """Best-effort server-side requeue of dead IN_PROGRESS files.
+
+        One call sweeps every site of the project. Contained: a
+        pre-requeueStale server (404) or transient error only logs
+        (warn-once) and the next interval retries.
+        """
+        try:
+            count = self.addon.requeue_stale_transfers(
+                project_name, older_than_seconds=_STALE_REQUEUE_AGE
+            )
+            if count:
+                self.log.info(
+                    "Requeued {} stalled IN_PROGRESS file(s)"
+                    " in '{}'".format(count, project_name)
+                )
+        except Exception:
+            self._warn_once(
+                (project_name, "requeue_stale"),
+                (
+                    "Couldn't requeue stale transfers for '{}'"
+                    " (old server without the endpoint?)"
+                ).format(project_name),
+                exc_info=True
+            )
 
     def _backfill_site_records(self, project_name):
         """Best-effort server-side backfill of zero-record representations.
@@ -492,12 +627,27 @@ class SiteSyncThread(threading.Thread):
             periodically.
         """
         while self.is_running:
-            if self.addon.long_running_tasks:
-                task = self.addon.long_running_tasks.pop()
-                self.log.info("starting long running")
-                await self.loop.run_in_executor(None, task["func"])
-                self.log.info("finished long running")
-                self.addon.projects_processed.remove(task["project_name"])
+            # This coroutine is the only consumer of long-running tasks
+            # AND the only path to a clean loop shutdown - an escaped
+            # exception here would kill both, so contain everything.
+            # (Scheduled funcs are supposed to never raise, but that
+            # invariant lives in their authors' hands.)
+            try:
+                if self.addon.long_running_tasks:
+                    task = self.addon.long_running_tasks.pop()
+                    self.log.info("starting long running")
+                    try:
+                        await self.loop.run_in_executor(None, task["func"])
+                    finally:
+                        self.log.info("finished long running")
+                        self.addon.projects_processed.discard(
+                            task["project_name"])
+            except asyncio.exceptions.CancelledError:
+                raise
+            except Exception:
+                self.log.warning(
+                    "Long running task failed", exc_info=True
+                )
             await asyncio.sleep(0.5)
 
         tasks = [
@@ -515,25 +665,20 @@ class SiteSyncThread(threading.Thread):
         await asyncio.sleep(0.07)
         self.loop.stop()
 
-    async def run_timer(self, delay):
-        """Wait for 'delay' seconds to start next loop"""
-        await asyncio.sleep(delay)
-
     def reset_timer(self):
         """Called when waiting for next loop should be skipped"""
         self.log.debug("Resetting timer")
-        timer = self.timer
-        if timer is None:
-            return
-        self.timer = None
+        # Backstop for calls arriving before run() created the event -
+        # the loop checks this flag before every wait. Plain attribute
+        # write, atomic enough for the foreign threads calling this.
+        self._reset_requested = True
         loop = self.loop
-        if loop is not None and loop.is_running():
-            # Callers live in other threads (tray UI, tray webserver route)
-            # while the timer task belongs to this thread's event loop -
-            # cancelling directly from a foreign thread is not safe.
-            loop.call_soon_threadsafe(timer.cancel)
-        else:
-            timer.cancel()
+        event = self._wake_event
+        if loop is not None and loop.is_running() and event is not None:
+            # Callers live in other threads (tray UI, tray webserver
+            # route) while the event belongs to this thread's loop -
+            # setting it directly from a foreign thread is not safe.
+            loop.call_soon_threadsafe(event.set)
 
     def _warn_once(self, key, message, exc_info=False):
         """Log a warning only once per thread lifetime for given 'key'.
@@ -750,25 +895,58 @@ class SiteSyncThread(threading.Thread):
         for file_result, info in zip(files_created, files_processed_info):
             file_state, repre_status, site_name, side, project_name = info
             error = None
+            if isinstance(
+                file_result, (TransferPausedError, TransientTransferError)
+            ):
+                # A pause is deliberate and a quota/rate-limit heals on
+                # its own - neither is a failure: requeue the file (its
+                # progress posts left it IN_PROGRESS, which the loop's
+                # OK/QUEUED pair fetch could never see again) without
+                # counting a retry or storing an error.
+                try:
+                    self.addon.update_db(
+                        project_name=project_name,
+                        new_file_id=None,
+                        file=file_state,
+                        repre_status=repre_status,
+                        site_name=site_name,
+                        side=side,
+                        requeue=True
+                    )
+                except Exception:
+                    self.log.warning(
+                        "Couldn't requeue paused file", exc_info=True)
+                continue
             if isinstance(file_result, BaseException):
                 error = str(file_result)
                 self.log.warning(error, exc_info=True)
                 file_result = None  # it is exception >> no id >> reset
 
-            self.addon.update_db(
-                project_name=project_name,
-                new_file_id=file_result,
-                file=file_state,
-                repre_status=repre_status,
-                site_name=site_name,
-                side=side,
-                error=error
-            )
+            # One failed status POST (server blip) must not drop the
+            # results of every remaining file in the batch - those files
+            # DID transfer and would be transferred again next pass.
+            try:
+                self.addon.update_db(
+                    project_name=project_name,
+                    new_file_id=file_result,
+                    file=file_state,
+                    repre_status=repre_status,
+                    site_name=site_name,
+                    side=side,
+                    error=error
+                )
 
-            repre_id = repre_status["representationId"]
-            self.addon.handle_alternate_site(
-                project_name,
-                repre_id,
-                site_name,
-                file_state["fileHash"]
-            )
+                repre_id = repre_status["representationId"]
+                self.addon.handle_alternate_site(
+                    project_name,
+                    repre_id,
+                    site_name,
+                    file_state["fileHash"]
+                )
+            except Exception:
+                self.log.warning(
+                    "Couldn't update status of '{}' on '{}' - will retry"
+                    " next loop".format(
+                        file_state.get("path"), site_name),
+                    exc_info=True
+                )
